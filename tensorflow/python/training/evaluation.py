@@ -18,11 +18,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import math
 import time
 
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import init_ops
+from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import state_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.platform import tf_logging as logging
@@ -58,6 +61,76 @@ def _get_or_create_eval_step():
     return counter
 
 
+def _get_latest_eval_step_value(update_ops):
+  """Gets the eval step `Tensor` value after running `update_ops`.
+
+  Args:
+    update_ops: A list of `Tensors` or a dictionary of names to `Tensors`,
+        which are run before reading the eval step value.
+
+  Returns:
+    A `Tensor` representing the value for the evaluation step.
+  """
+  if isinstance(update_ops, dict):
+    update_ops = list(update_ops.values())
+
+  with ops.control_dependencies(update_ops):
+    return array_ops.identity(_get_or_create_eval_step().read_value())
+
+
+class _MultiStepStopAfterNEvalsHook(session_run_hook.SessionRunHook):
+  """Run hook used by the evaluation routines to run the `eval_ops` N times."""
+
+  def __init__(self, num_evals, steps_per_run=1):
+    """Constructs the run hook.
+
+    Args:
+      num_evals: The number of evaluations to run for. if set to None, will
+        iterate the dataset until all inputs are exhausted.
+      steps_per_run: Number of steps executed per run call.
+    """
+    self._num_evals = num_evals
+    self._evals_completed = None
+    self._steps_per_run_initial_value = steps_per_run
+
+  def _set_evals_completed_tensor(self, updated_eval_step):
+    self._evals_completed = updated_eval_step
+
+  def begin(self):
+    self._steps_per_run_variable = \
+        basic_session_run_hooks.get_or_create_steps_per_run_variable()
+
+  def after_create_session(self, session, coord):
+    # Update number of steps to run in the first run call
+    if  self._num_evals is None:
+      steps = self._steps_per_run_initial_value
+    else:
+      steps = min(self._steps_per_run_initial_value, self._num_evals)
+    self._steps_per_run_variable.load(steps, session=session)
+
+  def before_run(self, run_context):
+    return session_run_hook.SessionRunArgs({
+        'evals_completed': self._evals_completed
+    })
+
+  def after_run(self, run_context, run_values):
+    evals_completed = run_values.results['evals_completed']
+    # Update number of steps to run in the next iteration
+    if  self._num_evals is None:
+      steps = self._steps_per_run_initial_value
+    else:
+      steps = min(self._num_evals - evals_completed,
+                  self._steps_per_run_initial_value)
+    self._steps_per_run_variable.load(steps, session=run_context.session)
+
+    if self._num_evals is None:
+      logging.info('Evaluation [%d]', evals_completed)
+    else:
+      logging.info('Evaluation [%d/%d]', evals_completed, self._num_evals)
+    if self._num_evals is not None and evals_completed >= self._num_evals:
+      run_context.request_stop()
+
+
 class _StopAfterNEvalsHook(session_run_hook.SessionRunHook):
   """Run hook used by the evaluation routines to run the `eval_ops` N times."""
 
@@ -65,13 +138,17 @@ class _StopAfterNEvalsHook(session_run_hook.SessionRunHook):
     """Constructs the run hook.
 
     Args:
-      num_evals: The number of evaluations to run for.
+      num_evals: The number of evaluations to run for. if set to None, will
+        iterate the dataset until all inputs are exhausted.
       log_progress: Whether to log evaluation progress, defaults to True.
     """
     # The number of evals to run for.
     self._num_evals = num_evals
     self._evals_completed = None
     self._log_progress = log_progress
+    # Reduce logging frequency if there are 20 or more evaluations.
+    self._log_frequency = (1 if (num_evals is None or num_evals < 20)
+                           else math.floor(num_evals / 10.))
 
   def _set_evals_completed_tensor(self, updated_eval_step):
     self._evals_completed = updated_eval_step
@@ -84,8 +161,13 @@ class _StopAfterNEvalsHook(session_run_hook.SessionRunHook):
   def after_run(self, run_context, run_values):
     evals_completed = run_values.results['evals_completed']
     if self._log_progress:
-      logging.info('Evaluation [%d/%d]', evals_completed, self._num_evals)
-    if evals_completed >= self._num_evals:
+      if self._num_evals is None:
+        logging.info('Evaluation [%d]', evals_completed)
+      else:
+        if ((evals_completed % self._log_frequency) == 0 or
+            (self._num_evals == evals_completed)):
+          logging.info('Evaluation [%d/%d]', evals_completed, self._num_evals)
+    if self._num_evals is not None and evals_completed >= self._num_evals:
       run_context.request_stop()
 
 
@@ -145,14 +227,18 @@ def _evaluate_once(checkpoint_path,
   eval_step = _get_or_create_eval_step()
 
   # Prepare the run hooks.
-  hooks = hooks or []
+  hooks = list(hooks or [])
 
   if eval_ops is not None:
-    update_eval_step = state_ops.assign_add(eval_step, 1)
-
-    for h in hooks:
-      if isinstance(h, _StopAfterNEvalsHook):
-        h._set_evals_completed_tensor(update_eval_step)  # pylint: disable=protected-access
+    if any([isinstance(h, _MultiStepStopAfterNEvalsHook) for h in hooks]):
+      steps_per_run_variable = \
+          basic_session_run_hooks.get_or_create_steps_per_run_variable()
+      update_eval_step = state_ops.assign_add(
+          eval_step,
+          math_ops.cast(steps_per_run_variable, dtype=eval_step.dtype),
+          use_locking=True)
+    else:
+      update_eval_step = state_ops.assign_add(eval_step, 1, use_locking=True)
 
     if isinstance(eval_ops, dict):
       eval_ops['update_eval_step'] = update_eval_step
@@ -160,6 +246,12 @@ def _evaluate_once(checkpoint_path,
       eval_ops = list(eval_ops) + [update_eval_step]
     else:
       eval_ops = [eval_ops, update_eval_step]
+
+    eval_step_value = _get_latest_eval_step_value(eval_ops)
+
+    for h in hooks:
+      if isinstance(h, (_StopAfterNEvalsHook, _MultiStepStopAfterNEvalsHook)):
+        h._set_evals_completed_tensor(eval_step_value)  # pylint: disable=protected-access
 
   logging.info('Starting evaluation at ' + time.strftime('%Y-%m-%d-%H:%M:%S',
                                                          time.gmtime()))

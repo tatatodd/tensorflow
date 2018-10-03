@@ -18,12 +18,29 @@ limitations under the License.
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/shape_inference_testutil.h"
+#include "tensorflow/core/framework/tensor.pb.h"
+#include "tensorflow/core/framework/tensor_shape.pb.h"
 #include "tensorflow/core/framework/tensor_testutil.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
+
+TEST(ArrayOpsTest, UnravelIndex_ShapeFn) {
+  ShapeInferenceTestOp op("UnravelIndex");
+
+  INFER_OK(op, "?;?", "?");
+
+  INFER_OK(op, "[];[?]", "[d1_0]");
+
+  INFER_OK(op, "[4,5];[?]", "[d1_0,20]");
+  INFER_OK(op, "[2,3,4];[?]", "[d1_0,24]");
+  INFER_OK(op, "?;[?]", "?");
+  INFER_OK(op, "[?];[?]", "[d1_0,?]");
+
+  INFER_ERROR("Shape must be rank 1 but is rank 2", op, "?;[1,1]");
+}
 
 TEST(ArrayOpsTest, Pack_ShapeFn) {
   ShapeInferenceTestOp op("Pack");
@@ -140,8 +157,13 @@ TEST(ArrayOpsTest, Const_ShapeFn) {
 
 TEST(ArrayOpsTest, UnchangedShapes_ShapeFn) {
   for (const char* op_name : {
-           "CheckNumerics", "Identity", "RefIdentity", "QuantizeAndDequantize",
-           "StopGradient", "ZerosLike", "OnesLike",
+           "CheckNumerics",
+           "Identity",
+           "RefIdentity",
+           "QuantizeAndDequantize",
+           "StopGradient",
+           "ZerosLike",
+           "OnesLike",
        }) {
     ShapeInferenceTestOp op(op_name);
     INFER_OK(op, "?", "in0");
@@ -154,6 +176,13 @@ TEST(ArrayOpsTest, UnchangedShapes_ShapeFn) {
   INFER_OK(op, "?;?;?", "in0");
   INFER_OK(op, "[];?;?", "in0");
   INFER_OK(op, "[1,2,?,4,5];?;?", "in0");
+}
+
+TEST(ArrayOpsTest, GuaranteeConst_ShapeFn) {
+  ShapeInferenceTestOp op("GuaranteeConst");
+  INFER_OK(op, "?", "in0");
+  INFER_OK(op, "[]", "in0");
+  INFER_OK(op, "[1,2,?,4,5]", "in0");
 }
 
 TEST(ArrayOpsTest, Identity_ShapeFnHandles) {
@@ -184,21 +213,20 @@ TEST(ArrayOpsTest, Identity_ShapeFnHandles) {
 TEST(ArrayOpsTest, Diag_ShapeFn) {
   ShapeInferenceTestOp op("Diag");
   INFER_OK(op, "?", "?");
-  INFER_OK(op, "[]", "[]");
   INFER_OK(op, "[1,?,3]", "[d0_0,d0_1,d0_2,d0_0,d0_1,d0_2]");
-  INFER_ERROR("Shape must be at most rank 3 but is rank 4", op, "[?,1,2,3]");
+  INFER_OK(op, "[?,1,2,3]", "[d0_0,d0_1,d0_2,d0_3,d0_0,d0_1,d0_2,d0_3]");
+  INFER_ERROR("Shape must be at least rank 1 but is rank 0", op, "[]");
 }
 
 TEST(ArrayOpsTest, DiagPart_ShapeFn) {
   ShapeInferenceTestOp op("DiagPart");
   INFER_OK(op, "?", "?");
-  INFER_OK(op, "[]", "[]");
   INFER_OK(op, "[1,?,?,4]", "[d0_0,d0_3]");
   INFER_OK(op, "[1,?,3,?,4,3]", "[d0_0,d0_4,d0_2|d0_5]");
-  INFER_ERROR("Input must have even rank <= 6, input rank is 1", op, "[?]");
-  INFER_ERROR("Input must have even rank <= 6, input rank is 3", op, "[1,2,3]");
-  INFER_ERROR("Input must have even rank <= 6, input rank is 8", op,
-              "[1,2,3,?,?,?,?,?]");
+  INFER_OK(op, "[1,2,3,?,?,?,?,4]", "[d0_0,d0_1,d0_2,d0_7]");
+  INFER_ERROR("Input must have even and non-zero rank", op, "[]");
+  INFER_ERROR("Input must have even and non-zero rank", op, "[?]");
+  INFER_ERROR("Input must have even and non-zero rank", op, "[1,2,3]");
   INFER_ERROR("Dimensions must be equal, but are 2 and 10", op, "[1,2,?,10]");
 }
 
@@ -245,6 +273,7 @@ TEST(ArrayOpsTest, ReverseV2_ShapeFn) {
 
 TEST(ArrayOpsTest, Fill_ShapeFn) {
   ShapeInferenceTestOp op("Fill");
+  AddNodeAttr("index_type", DT_INT32, &op.node_def);
   op.input_tensors.resize(2);
   INFER_OK(op, "?;?", "?");
   INFER_OK(op, "[?];?", "?");
@@ -260,6 +289,61 @@ TEST(ArrayOpsTest, Gather_ShapeFn) {
   INFER_OK(op, "?;?", "?");
   INFER_OK(op, "[1,?,2];[3]", "[d1_0,d0_1,d0_2]");
   INFER_ERROR("Shape must be at least rank 1 but is rank 0", op, "[];[1,2,3]");
+}
+
+TEST(ArrayOpsTest, GatherV2_ShapeFn) {
+  ShapeInferenceTestOp op("GatherV2");
+
+  // Tests when axis is unknown.
+  INFER_OK(op, "?;?;?", "?");
+  INFER_OK(op, "[1,2,3];[3];[]", "[?,?,?]");
+  INFER_ERROR("Shape must be at least rank 1 but is rank 0", op,
+              "[];[1,2,3];[]");
+
+  // Non-scalar axis.
+  INFER_ERROR("Shape must be rank 0 but is rank 1", op, "[1];[1,2,3];[1]");
+
+  // Test when axis dim is known.
+  Tensor axis_dim_t;
+  op.input_tensors.resize(3);
+  op.input_tensors[2] = &axis_dim_t;
+
+  // Out of range axis.
+  axis_dim_t = test::AsScalar(1);
+  INFER_ERROR("Shape must be at least rank 2 but is rank 1", op,
+              "[1];[1,2];[]");
+
+  // Rank 0 indices.
+  axis_dim_t = test::AsScalar(0);
+  INFER_OK(op, "[1,2,3];[];[]", "[d0_1,d0_2]");
+  axis_dim_t = test::AsScalar(1);
+  INFER_OK(op, "[1,2,3];[];[]", "[d0_0,d0_2]");
+  axis_dim_t = test::AsScalar(2);
+  INFER_OK(op, "[1,2,3];[];[]", "[d0_0,d0_1]");
+
+  // Rank 1 indices.
+  axis_dim_t = test::AsScalar(0);
+  INFER_OK(op, "[1,2,3];[5];[]", "[d1_0,d0_1,d0_2]");
+  axis_dim_t = test::AsScalar(1);
+  INFER_OK(op, "[1,2,3];[5];[]", "[d0_0,d1_0,d0_2]");
+  axis_dim_t = test::AsScalar(2);
+  INFER_OK(op, "[1,2,3];[5];[]", "[d0_0,d0_1,d1_0]");
+
+  // Rank 2 indices.
+  axis_dim_t = test::AsScalar(0);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d1_0,d1_1,d0_1,d0_2]");
+  axis_dim_t = test::AsScalar(1);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d0_0,d1_0,d1_1,d0_2]");
+  axis_dim_t = test::AsScalar(2);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d0_0,d0_1,d1_0,d1_1]");
+
+  // Negative axis.
+  axis_dim_t = test::AsScalar(-3);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d1_0,d1_1,d0_1,d0_2]");
+  axis_dim_t = test::AsScalar(-2);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d0_0,d1_0,d1_1,d0_2]");
+  axis_dim_t = test::AsScalar(-1);
+  INFER_OK(op, "[1,2,3];[5,6];[]", "[d0_0,d0_1,d1_0,d1_1]");
 }
 
 TEST(ArrayOpsTest, GatherNd_ShapeFn) {
@@ -299,7 +383,11 @@ TEST(ArrayOpsTest, ShapeN_ShapeFn) {
 TEST(ArrayOpsTest, Unique_ShapeFn) {
   ShapeInferenceTestOp op("Unique");
   INFER_OK(op, "?", "[?];in0");
-  INFER_OK(op, "[1,2,3,?,5]", "[?];in0");
+  INFER_OK(op, "[5]", "[?];in0");
+  INFER_ERROR(
+      "Shape must be rank 1 but is rank 5 for '' (op: '') with input shapes: "
+      "[1,2,3,?,5].",
+      op, "[1,2,3,?,5]");
 }
 
 TEST(ArrayOpsTest, UniqueWithCounts_ShapeFn) {
@@ -345,6 +433,36 @@ TEST(ArrayOpsTest, PadD_ShapeFn) {
     INFER_OK(op, "?;[3,2]", "[?,?,?]");
     INFER_OK(op, "?;?", "[?,?,?]");
   }
+}
+
+TEST(ArrayOpsTest, PadV2_ShapeFn) {
+  ShapeInferenceTestOp op("PadV2");
+  op.input_tensors.resize(3);
+
+  // Inputs are input, paddings and constant_values.
+
+  INFER_OK(op, "?;?;?", "?");
+
+  // Check shape of paddings.
+  INFER_ERROR("Shape must be rank 2 but is rank 3", op, "?;[1,2,3];?");
+  INFER_ERROR("Dimension must be 2 but is 4", op, "?;[1,4];?");
+
+  // input.rank and paddings.dim(0) are equal. This is the number of dims in
+  // output.
+  INFER_ERROR("Shape must be rank 4 but is rank 3", op, "[1,2,3];[4,2];[]");
+  INFER_OK(op, "[1,2,3];?;[]", "[?,?,?]");
+  INFER_OK(op, "?;[3,2];[]", "[?,?,?]");
+
+  // Make the paddings tensor known and verify padding values get added.
+  // E.g., if padding is ((1,10),(2,20),(3,30)) then values 11,22,23 are added
+  // to input dims to get output.
+  Tensor paddings_t(DT_INT64, TensorShape{3, 2});
+  test::FillValues<int64>(&paddings_t, {1, 10, 2, 20, 3, 30});
+  op.input_tensors[1] = &paddings_t;
+  INFER_OK(op, "[100,200,300];[3,2];[]", "[111,222,333]");
+  INFER_OK(op, "[100,?,300];[3,2];[]", "[111,?,333]");
+  INFER_OK(op, "?;[3,2];[]", "[?,?,?]");
+  INFER_OK(op, "?;?;[]", "[?,?,?]");
 }
 
 TEST(ArrayOpsTest, MirrorPadGrad_ShapeFn) {
@@ -428,7 +546,7 @@ TEST(ArrayOpsTest, MatrixSetDiag_ShapeFn) {
   INFER_ERROR("Dimensions must be equal, but are 2 and 3", op, "[2,3];[3]");
 
   // Output matches input.
-  INFER_OK(op, "?;?", "?");
+  INFER_OK(op, "?;?", "in0");
   INFER_OK(op, "[1,2,2];[1,2]", "in0");
   INFER_OK(op, "[1,2,3];?", "in0");
   INFER_OK(op, "[1,3,2];?", "in0");
@@ -735,7 +853,7 @@ TEST(ArrayOpsTest, Reshape_ShapeFn) {
   // Unknown dimensions.
   // Flatten:
   new_shape = test::AsTensor<int32>({-1});
-  INFER_OK(op, "[?];[1]", "[?]");
+  INFER_OK(op, "[?];[1]", "[d0_0]");
   INFER_OK(op, "[2,2];[1]", "[4]");
   // The first dimension is inferred:
   new_shape = test::AsTensor<int32>({2, -1});
@@ -747,6 +865,10 @@ TEST(ArrayOpsTest, Reshape_ShapeFn) {
   // Multiple missing dimensions cannot be inferred.
   new_shape = test::AsTensor<int32>({-1, -1, 2});
   INFER_OK(op, "[8];[3]", "[?,?,2]");
+
+  // Symbolic shape propagation
+  new_shape = test::AsTensor<int32>({-1, 2, 3});
+  INFER_OK(op, "[?,2,3];[3]", "[d0_0,2,3]");
 
   // Reshaping to a scalar.
   new_shape = test::AsTensor<int32>({});
@@ -1498,6 +1620,24 @@ TEST(ArrayOpsTest, Slice_ShapeFn) {
   INFER_ERROR("cannot be < -1", op, "[2,3,4,5];[4];[4]");
 }
 
+TEST(ArrayOpsTest, StridedSlice_ShapeFn) {
+  ShapeInferenceTestOp op("StridedSlice");
+  TF_ASSERT_OK(NodeDefBuilder("test", "StridedSlice")
+                   .Input("input", 0, DT_FLOAT)
+                   .Input("begin", 1, DT_INT32)
+                   .Input("end", 2, DT_INT32)
+                   .Input("strides", 3, DT_INT32)
+                   .Attr("shrink_axis_mask", 1)
+                   .Finalize(&op.node_def));
+  op.input_tensors.resize(4);
+  Tensor strides = test::AsTensor<int32>({1});
+  op.input_tensors[3] = &strides;
+  // Slicing on the 0-th dimension.
+  INFER_OK(op, "[2,3,4,5];[1];[1];[1]", "[3,4,5]");
+  // Slicing on the 0-th dimension. This time some of the result dimension is 0.
+  INFER_OK(op, "[2,0,3,4];[1];[1];[1]", "[0,3,4]");
+}
+
 TEST(ArrayOpsTest, StridedSliceGrad_ShapeFn) {
   ShapeInferenceTestOp op("StridedSliceGrad");
   op.input_tensors.resize(5);
@@ -1526,7 +1666,7 @@ TEST(ArrayOpsTest, UnchangedWithQuantizationScalars_ShapeFn) {
 TEST(ArrayOpsTest, FakeQuantWithMinMaxVarsPerChannel) {
   ShapeInferenceTestOp op("FakeQuantWithMinMaxVarsPerChannel");
 
-  INFER_OK(op, "?;?;?", "?");
+  INFER_OK(op, "?;?;?", "in0");
   INFER_OK(op, "[?];?;?", "in0");
   INFER_OK(op, "[1,?,3];[3];[3]", "in0");
   INFER_OK(op, "[3];[3];[3]", "in0");
@@ -1545,7 +1685,7 @@ TEST(ArrayOpsTest, FakeQuantWithMinMaxVarsPerChannel) {
 TEST(ArrayOpsTest, FakeQuantWithMinMaxVarsPerChannelGradient) {
   ShapeInferenceTestOp op("FakeQuantWithMinMaxVarsPerChannelGradient");
 
-  INFER_OK(op, "?;?;?;?", "?;[?];[?]");
+  INFER_OK(op, "?;?;?;?", "in0;[?];[?]");
   INFER_OK(op, "[3];[3];[3];[3]", "in0;in3;in3");
   INFER_OK(op, "[1,3];[1,3];[3];[3]", "in0;in3;in3");
   INFER_OK(op, "[1,2,3,4];[1,2,3,4];[4];[4]", "in0;in3;in3");

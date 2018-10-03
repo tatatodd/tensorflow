@@ -20,6 +20,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "absl/container/flat_hash_set.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
 #include "tensorflow/compiler/xla/service/hlo_module.h"
 #include "tensorflow/compiler/xla/service/hlo_ordering.h"
@@ -27,8 +28,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/lib/gtl/flatmap.h"
-#include "tensorflow/core/lib/gtl/flatset.h"
 
 namespace xla {
 
@@ -36,12 +35,12 @@ namespace xla {
 // interference.
 class BufferLiveness {
  public:
+  using Colorer = std::function<Status(const BufferLiveness& buffer_liveness)>;
+
   // Constructs a buffer liveness object for the given module assuming the given
   // HLO instruction ordering.
   static StatusOr<std::unique_ptr<BufferLiveness>> Run(
-      const HloModule* module, std::unique_ptr<HloOrdering> hlo_ordering,
-      TuplePointsToAnalysis::Colorer colorer =
-          TuplePointsToAnalysis::DefaultColorer());
+      const HloModule* module, std::unique_ptr<HloOrdering> hlo_ordering);
 
   // Returns true if the live range of the buffer containing the output of 'a'
   // may overlap with the live range of the buffer of 'b'. If instruction 'a'
@@ -54,8 +53,7 @@ class BufferLiveness {
   bool MaybeLiveOut(const LogicalBuffer& buffer) const;
 
   // Returns the complete set of buffers that may be live out of the module.
-  const tensorflow::gtl::FlatSet<const LogicalBuffer*>& maybe_live_out_buffers()
-      const {
+  const PointsToSet::BufferSet& maybe_live_out_buffers() const {
     return maybe_live_out_buffers_;
   }
 
@@ -67,19 +65,30 @@ class BufferLiveness {
   // Returns the underlying hlo ordering used for this liveness analysis.
   const HloOrdering& hlo_ordering() const { return *hlo_ordering_; }
 
+  const HloModule& module() const { return *module_; }
+
   string ToString() const;
+
+  static Colorer DefaultColorer() {
+    return [](const BufferLiveness& buffer_liveness) {
+      for (LogicalBuffer::Id id = 0;
+           id < buffer_liveness.points_to_analysis().num_logical_buffers();
+           id++) {
+        auto& buffer = buffer_liveness.points_to_analysis().logical_buffer(id);
+        buffer.set_color(LogicalBuffer::Color(0));
+      }
+      return Status::OK();
+    };
+  }
 
  private:
   explicit BufferLiveness(const HloModule* module,
-                          std::unique_ptr<HloOrdering> hlo_ordering,
-                          TuplePointsToAnalysis::Colorer colorer)
-      : module_(module),
-        hlo_ordering_(std::move(hlo_ordering)),
-        colorer_(colorer) {}
+                          std::unique_ptr<HloOrdering> hlo_ordering)
+      : module_(module), hlo_ordering_(std::move(hlo_ordering)) {}
 
   // Perform buffer liveness analysis. This method must be called prior to
   // MayInterfere or MaybeLiveOut.
-  tensorflow::Status Analyze();
+  Status Analyze();
 
   // Returns true if the live range of the buffer of 'a' is strictly before the
   // live range of the buffer of 'b' (they do not overlap).
@@ -92,14 +101,12 @@ class BufferLiveness {
   // Set of LogicalBuffers which are aliased in the output of other
   // instructions. For example, a LogicalBuffer which is inserted into a tuple
   // is considered to be aliased and will be in this set.
-  tensorflow::gtl::FlatSet<const LogicalBuffer*> aliased_buffers_;
+  absl::flat_hash_set<const LogicalBuffer*> aliased_buffers_;
 
   // LogicalBuffers that may be live out of the entry computation.
-  tensorflow::gtl::FlatSet<const LogicalBuffer*> maybe_live_out_buffers_;
+  PointsToSet::BufferSet maybe_live_out_buffers_;
 
   std::unique_ptr<TuplePointsToAnalysis> points_to_analysis_;
-
-  TuplePointsToAnalysis::Colorer colorer_;
 };
 
 }  // namespace xla

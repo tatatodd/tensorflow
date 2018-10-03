@@ -24,42 +24,62 @@ load(
     "tf_kernel_tests_linkstatic",
 )
 
+cc_library(
+    name = "all_ops",
+    deps = [
+        ":gru_ops_op_lib",
+        ":lstm_ops_op_lib",
+    ],
+)
+
+cc_library(
+    name = "all_kernels",
+    deps = [
+        ":gru_ops_kernels",
+        ":lstm_ops_kernels",
+    ],
+)
+
 tf_custom_op_py_library(
     name = "rnn_py",
-    srcs = ["__init__.py"] + glob(["python/ops/*.py"]),
+    srcs = ["__init__.py"] + glob(["python/ops/*.py"]) + [
+        "python/tools/checkpoint_convert.py",
+    ],
     dso = [
         ":python/ops/_gru_ops.so",
         ":python/ops/_lstm_ops.so",
     ],
     kernels = [
-        ":gru_ops_kernels",
-        ":lstm_ops_kernels",
-        ":gru_ops_op_lib",
-        ":lstm_ops_op_lib",
+        ":all_ops",
+        ":all_kernels",
     ],
     srcs_version = "PY2AND3",
     visibility = ["//visibility:public"],
     deps = [
+        ":benchmarking",
         ":gru_ops",
         ":lstm_ops",
         "//tensorflow/contrib/compiler:compiler_py",
         "//tensorflow/contrib/layers:layers_py",
         "//tensorflow/contrib/util:util_py",
+        "//tensorflow/core:protos_all_py",
         "//tensorflow/python:array_ops",
         "//tensorflow/python:clip_ops",
         "//tensorflow/python:embedding_ops",
-        "//tensorflow/python:framework",
         "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:init_ops",
-        "//tensorflow/python:layers",
         "//tensorflow/python:math_ops",
         "//tensorflow/python:nn_ops",
-        "//tensorflow/python:partitioned_variables",
         "//tensorflow/python:platform",
+        "//tensorflow/python:pywrap_tensorflow",
+        "//tensorflow/python:random_ops",
         "//tensorflow/python:rnn",
         "//tensorflow/python:rnn_cell",
+        "//tensorflow/python:session",
+        "//tensorflow/python:training",
         "//tensorflow/python:util",
         "//tensorflow/python:variable_scope",
+        "//tensorflow/python:variables",
     ],
 )
 
@@ -83,7 +103,6 @@ cuda_py_tests(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
     ],
-    tags = ["notsan"],  # http://b/62135981
     xla_enabled = True,
 )
 
@@ -99,7 +118,6 @@ cuda_py_tests(
         "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:init_ops",
         "//tensorflow/python:math_ops",
-        "//tensorflow/python:random_ops",
         "//tensorflow/python:rnn",
         "//tensorflow/python:rnn_cell",
         "//tensorflow/python:variable_scope",
@@ -124,11 +142,14 @@ cuda_py_tests(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
     ],
+    tags = [
+        "optonly",
+    ],
 )
 
 cuda_py_tests(
     name = "core_rnn_test",
-    size = "large",
+    size = "medium",
     srcs = ["python/kernel_tests/core_rnn_test.py"],
     additional_deps = [
         ":rnn_py",
@@ -137,6 +158,7 @@ cuda_py_tests(
         "//tensorflow/python:client_testlib",
         "//tensorflow/python:control_flow_ops",
         "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:framework_test_lib",
         "//tensorflow/python:gradients",
         "//tensorflow/python:init_ops",
         "//tensorflow/python:math_ops",
@@ -146,13 +168,14 @@ cuda_py_tests(
         "//tensorflow/python:util",
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
+        "//tensorflow/python/eager:context",
     ],
     shard_count = 10,
 )
 
 tf_py_test(
     name = "fused_rnn_cell_test",
-    size = "small",
+    size = "medium",
     srcs = ["python/kernel_tests/fused_rnn_cell_test.py"],
     additional_deps = [
         ":rnn_py",
@@ -164,6 +187,8 @@ tf_py_test(
         "//tensorflow/python:gradients",
         "//tensorflow/python:init_ops",
         "//tensorflow/python:platform_test",
+        "//tensorflow/python:rnn",
+        "//tensorflow/python:rnn_cell",
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
     ],
@@ -187,6 +212,7 @@ cuda_py_tests(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
     ],
+    tags = ["noasan"],
 )
 
 tf_custom_op_library(
@@ -203,9 +229,7 @@ tf_custom_op_library(
         "kernels/lstm_ops_gpu.cu.cc",
         "kernels/lstm_ops.h",
     ],
-    deps = [
-        "//tensorflow/core/kernels:eigen_helpers",
-    ],
+    deps = ["//tensorflow/core/kernels:eigen_helpers"],
 )
 
 tf_gen_op_wrapper_py(
@@ -227,9 +251,7 @@ tf_custom_op_library(
         "kernels/gru_ops_gpu.cu.cc",
         "kernels/gru_ops.h",
     ],
-    deps = [
-        "//tensorflow/core/kernels:eigen_helpers",
-    ],
+    deps = ["//tensorflow/core/kernels:eigen_helpers"],
 )
 
 tf_gen_op_wrapper_py(
@@ -258,6 +280,10 @@ cuda_py_tests(
         "//tensorflow/python:variable_scope",
         "//tensorflow/python:variables",
     ],
+    tags = [
+        "no_oss",
+        "noasan",
+    ],
 )
 
 tf_cc_test(
@@ -265,6 +291,7 @@ tf_cc_test(
     size = "small",
     srcs = ["ops/gru_ops_test.cc"],
     data = [":python/ops/_gru_ops.so"],
+    tags = ["noasan"],
     # We must ensure that the dependencies can be dynamically linked since
     # the shared library must be able to use core:framework.
     # linkstatic = tf_kernel_tests_linkstatic(),
@@ -284,6 +311,7 @@ tf_cc_test(
     size = "small",
     srcs = ["ops/lstm_ops_test.cc"],
     data = [":python/ops/_lstm_ops.so"],
+    tags = ["noasan"],
     # We must ensure that the dependencies can be dynamically linked since
     # the shared library must be able to use core:framework.
     # linkstatic = tf_kernel_tests_linkstatic(),
@@ -296,19 +324,6 @@ tf_cc_test(
         "//tensorflow/core:test_main",
         "//tensorflow/core:testlib",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-            "tools/**",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )
 
 tf_gen_op_libs(
@@ -360,10 +375,10 @@ py_binary(
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/core:protos_all_py",
-        "//tensorflow/python:client",
         "//tensorflow/python:framework_ops",
         "//tensorflow/python:platform",
         "//tensorflow/python:pywrap_tensorflow",
+        "//tensorflow/python:session",
         "//tensorflow/python:training",
         "//tensorflow/python:variables",
     ],
@@ -377,10 +392,17 @@ py_test(
     tags = ["no_pip"],
     deps = [
         ":checkpoint_convert",
-        "//tensorflow/python:client",
         "//tensorflow/python:client_testlib",
         "//tensorflow/python:framework_ops",
+        "//tensorflow/python:session",
         "//tensorflow/python:training",
         "//tensorflow/python:variables",
     ],
+)
+
+py_library(
+    name = "benchmarking",
+    srcs = ["python/kernel_tests/benchmarking.py"],
+    srcs_version = "PY2AND3",
+    deps = ["//tensorflow/python:framework_ops"],
 )

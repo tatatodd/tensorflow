@@ -1,645 +1,964 @@
 # TensorFlow external dependencies that can be loaded in WORKSPACE files.
 
 load("//third_party/gpus:cuda_configure.bzl", "cuda_configure")
-load("//third_party/sycl:sycl_configure.bzl", "sycl_configure")
-load("@io_bazel_rules_closure//closure/private:java_import_external.bzl", "java_import_external")
-load("@io_bazel_rules_closure//closure:defs.bzl", "filegroup_external")
+load("//third_party/gpus:rocm_configure.bzl", "rocm_configure")
+load("//third_party/tensorrt:tensorrt_configure.bzl", "tensorrt_configure")
+load("//third_party:nccl/nccl_configure.bzl", "nccl_configure")
+load("//third_party/mkl:build_defs.bzl", "mkl_repository")
+load("//third_party/git:git_configure.bzl", "git_configure")
 load("//third_party/py:python_configure.bzl", "python_configure")
 
-
-def _is_windows(repository_ctx):
-  """Returns true if the host operating system is windows."""
-  return repository_ctx.os.name.lower().find("windows") != -1
-
-
-def _get_env_var(repository_ctx, name):
-  """Find an environment variable."""
-  if name in repository_ctx.os.environ:
-    return repository_ctx.os.environ[name]
-  else:
-    return None
-
-
-# Parse the bazel version string from `native.bazel_version`.
-def _parse_bazel_version(bazel_version):
-  # Remove commit from version.
-  version = bazel_version.split(" ", 1)[0]
-
-  # Split into (release, date) parts and only return the release
-  # as a tuple of integers.
-  parts = version.split("-", 1)
-
-  # Turn "release" into a tuple of strings
-  version_tuple = ()
-  for number in parts[0].split("."):
-    version_tuple += (str(number),)
-  return version_tuple
-
-
-# Check that a specific bazel version is being used.
-def check_version(bazel_version):
-  if "bazel_version" not in dir(native):
-    fail("\nCurrent Bazel version is lower than 0.2.1, expected at least %s\n" %
-         bazel_version)
-  elif not native.bazel_version:
-    print("\nCurrent Bazel is not a release version, cannot check for " +
-          "compatibility.")
-    print("Make sure that you are running at least Bazel %s.\n" % bazel_version)
-  else:
-    current_bazel_version = _parse_bazel_version(native.bazel_version)
-    minimum_bazel_version = _parse_bazel_version(bazel_version)
-    if minimum_bazel_version > current_bazel_version:
-      fail("\nCurrent Bazel version is {}, expected at least {}\n".format(
-          native.bazel_version, bazel_version))
-
-
-def _repos_are_siblings():
-  return Label("@foo//bar").workspace_root.startswith("../")
-
-
-# Temporary workaround to support including TensorFlow as a submodule until this
-# use-case is supported in the next Bazel release.
-def _temp_workaround_http_archive_impl(repo_ctx):
-  repo_ctx.template("BUILD", repo_ctx.attr.build_file, {
-      "%prefix%": ".." if _repos_are_siblings() else "external",
-      "%ws%": repo_ctx.attr.repository
-  }, False)
-  repo_ctx.download_and_extract(repo_ctx.attr.urls, "", repo_ctx.attr.sha256,
-                                "", repo_ctx.attr.strip_prefix)
-  if repo_ctx.attr.patch_file != None:
-    _apply_patch(repo_ctx, repo_ctx.attr.patch_file)
-
-
-temp_workaround_http_archive = repository_rule(
-    implementation = _temp_workaround_http_archive_impl,
-    attrs = {
-        "build_file": attr.label(),
-        "repository": attr.string(),
-        "patch_file": attr.label(default = None),
-        "urls": attr.string_list(default = []),
-        "sha256": attr.string(default = ""),
-        "strip_prefix": attr.string(default = ""),
-    },
+load("//third_party/sycl:sycl_configure.bzl", "sycl_configure")
+load("//third_party/systemlibs:syslibs_configure.bzl", "syslibs_configure")
+load("//third_party/toolchains/clang6:repo.bzl", "clang6_configure")
+load("//third_party/toolchains/cpus/arm:arm_compiler_configure.bzl", "arm_compiler_configure")
+load("//third_party:repo.bzl", "tf_http_archive")
+load("//third_party/clang_toolchain:cc_configure_clang.bzl", "cc_download_clang_toolchain")
+load("@io_bazel_rules_closure//closure/private:java_import_external.bzl", "java_import_external")
+load("@io_bazel_rules_closure//closure:defs.bzl", "filegroup_external")
+load(
+    "//tensorflow/tools/def_file_filter:def_file_filter_configure.bzl",
+    "def_file_filter_configure",
 )
+load("//third_party/flatbuffers:workspace.bzl", flatbuffers = "repo")
+load("//third_party/icu:workspace.bzl", icu = "repo")
 
+def initialize_third_party():
+    flatbuffers()
+    icu()
 
-# Executes specified command with arguments and calls 'fail' if it exited with
-# non-zero code
-def _execute_and_check_ret_code(repo_ctx, cmd_and_args):
-  result = repo_ctx.execute(cmd_and_args, timeout=10)
-  if result.return_code != 0:
-    fail(("Non-zero return code({1}) when executing '{0}':\n" + "Stdout: {2}\n"
-          + "Stderr: {3}").format(" ".join(cmd_and_args), result.return_code,
-                                  result.stdout, result.stderr))
-
-
-# Apply a patch_file to the repository root directory
-# Runs 'patch -p1'
-def _apply_patch(repo_ctx, patch_file):
-  cmd = [
-      "patch", "-p1", "-d", repo_ctx.path("."), "-i", repo_ctx.path(patch_file)
-  ]
-  if _is_windows(repo_ctx):
-    bazel_sh = _get_env_var(repo_ctx, "BAZEL_SH")
-    if not bazel_sh:
-      fail("BAZEL_SH environment variable is not set")
-    cmd = [bazel_sh, "-c", " ".join(cmd)]
-  _execute_and_check_ret_code(repo_ctx, cmd)
-
-
-# Download the repository and apply a patch to its root
-def _patched_http_archive_impl(repo_ctx):
-  repo_ctx.download_and_extract(
-      repo_ctx.attr.urls,
-      sha256=repo_ctx.attr.sha256,
-      stripPrefix=repo_ctx.attr.strip_prefix)
-  _apply_patch(repo_ctx, repo_ctx.attr.patch_file)
-
-
-patched_http_archive = repository_rule(
-    implementation = _patched_http_archive_impl,
-    attrs = {
-        "patch_file": attr.label(),
-        "build_file": attr.label(),
-        "repository": attr.string(),
-        "urls": attr.string_list(default = []),
-        "sha256": attr.string(default = ""),
-        "strip_prefix": attr.string(default = ""),
-    },
-)
-
+# Sanitize a dependency so that it works correctly from code that includes
+# TensorFlow as a submodule.
+def clean_dep(dep):
+    return str(Label(dep))
 
 # If TensorFlow is linked as a submodule.
 # path_prefix is no longer used.
 # tf_repo_name is thought to be under consideration.
-def tf_workspace(path_prefix="", tf_repo_name=""):
-  # We must check the bazel version before trying to parse any other BUILD
-  # files, in case the parsing of those build files depends on the bazel
-  # version we require here.
-  check_version("0.4.5")
-  cuda_configure(name="local_config_cuda")
-  sycl_configure(name="local_config_sycl")
-  python_configure(name="local_config_python")
-  if path_prefix:
-    print("path_prefix was specified to tf_workspace but is no longer used " +
-          "and will be removed in the future.")
+def tf_workspace(path_prefix = "", tf_repo_name = ""):
+    # Note that we check the minimum bazel version in WORKSPACE.
+    clang6_configure(name = "local_config_clang6")
+    cc_download_clang_toolchain(name = "local_config_download_clang")
+    cuda_configure(name = "local_config_cuda")
+    tensorrt_configure(name = "local_config_tensorrt")
+    nccl_configure(name = "local_config_nccl")
+    git_configure(name = "local_config_git")
+    sycl_configure(name = "local_config_sycl")
+    syslibs_configure(name = "local_config_syslibs")
+    python_configure(name = "local_config_python")
+    rocm_configure(name = "local_config_rocm")
 
-  native.new_http_archive(
-      name = "eigen_archive",
-      urls = [
-          "http://mirror.bazel.build/bitbucket.org/eigen/eigen/get/f3a22f35b044.tar.gz",
-          "https://bitbucket.org/eigen/eigen/get/f3a22f35b044.tar.gz",
-      ],
-      sha256 = "ca7beac153d4059c02c8fc59816c82d54ea47fe58365e8aded4082ded0b820c4",
-      strip_prefix = "eigen-eigen-f3a22f35b044",
-      build_file = str(Label("//third_party:eigen.BUILD")),
-  )
+    initialize_third_party()
 
-  native.new_http_archive(
-      name = "libxsmm_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/hfp/libxsmm/archive/1.8.1.tar.gz",
-          "https://github.com/hfp/libxsmm/archive/1.8.1.tar.gz",
-      ],
-      sha256 = "2ade869c3f42f23b5263c7d594aa3c7e5e61ac6a3afcaf5d6e42899d2a7986ce",
-      strip_prefix = "libxsmm-1.8.1",
-      build_file = str(Label("//third_party:libxsmm.BUILD")),
-  )
+    # For windows bazel build
+    # TODO: Remove def file filter when TensorFlow can export symbols properly on Windows.
+    def_file_filter_configure(name = "local_config_def_file_filter")
 
-  native.bind(
-      name = "xsmm_avx",
-      actual = "@libxsmm_archive//third_party:xsmm_avx",
-  )
+    # Point //external/local_config_arm_compiler to //external/arm_compiler
+    arm_compiler_configure(
+        name = "local_config_arm_compiler",
+        build_file = clean_dep("//third_party/toolchains/cpus/arm:BUILD"),
+        remote_config_repo = "../arm_compiler",
+    )
 
-  native.new_http_archive(
-      name = "ortools_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/or-tools/archive/253f7955c6a1fd805408fba2e42ac6d45b312d15.tar.gz",
-          "https://github.com/google/or-tools/archive/253f7955c6a1fd805408fba2e42ac6d45b312d15.tar.gz",
-      ],
-      sha256 = "932075525642b04ac6f1b50589f1df5cd72ec2f448b721fd32234cf183f0e755",
-      strip_prefix = "or-tools-253f7955c6a1fd805408fba2e42ac6d45b312d15/src",
-      build_file = str(Label("//third_party:ortools.BUILD")),
-  )
+    mkl_repository(
+        name = "mkl_linux",
+        build_file = clean_dep("//third_party/mkl:mkl.BUILD"),
+        sha256 = "e2233534a9d15c387e22260997af4312a39e9f86f791768409be273b5453c4e6",
+        strip_prefix = "mklml_lnx_2019.0.20180710",
+        urls = [
+            "https://mirror.bazel.build/github.com/intel/mkl-dnn/releases/download/v0.16/mklml_lnx_2019.0.20180710.tgz",
+            "https://github.com/intel/mkl-dnn/releases/download/v0.16/mklml_lnx_2019.0.20180710.tgz",
+        ],
+    )
+    mkl_repository(
+        name = "mkl_windows",
+        build_file = clean_dep("//third_party/mkl:mkl.BUILD"),
+        sha256 = "3fdcff17b018a0082491adf3ba143358265336a801646e46e0191ec8d58d24a2",
+        strip_prefix = "mklml_win_2019.0.20180710",
+        urls = [
+            "https://mirror.bazel.build/github.com/intel/mkl-dnn/releases/download/v0.16/mklml_win_2019.0.20180710.zip",
+            "https://github.com/intel/mkl-dnn/releases/download/v0.16/mklml_win_2019.0.20180710.zip",
+        ],
+    )
+    mkl_repository(
+        name = "mkl_darwin",
+        build_file = clean_dep("//third_party/mkl:mkl.BUILD"),
+        sha256 = "411a30014a938eb83fb9f37b3dbe8e371b106fc1dd621fc23123cadc72737ce6",
+        strip_prefix = "mklml_mac_2019.0.20180710",
+        urls = [
+            "https://mirror.bazel.build/github.com/intel/mkl-dnn/releases/download/v0.16/mklml_mac_2019.0.20180710.tgz",
+            "https://github.com/intel/mkl-dnn/releases/download/v0.16/mklml_mac_2019.0.20180710.tgz",
+        ],
+    )
 
-  native.http_archive(
-      name = "com_googlesource_code_re2",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/re2/archive/b94b7cd42e9f02673cd748c1ac1d16db4052514c.tar.gz",
-          "https://github.com/google/re2/archive/b94b7cd42e9f02673cd748c1ac1d16db4052514c.tar.gz",
-      ],
-      sha256 = "bd63550101e056427c9e7ff12a408c1c8b74e9803f393ca916b2926fc2c4906f",
-      strip_prefix = "re2-b94b7cd42e9f02673cd748c1ac1d16db4052514c",
-  )
+    if path_prefix:
+        print("path_prefix was specified to tf_workspace but is no longer used " +
+              "and will be removed in the future.")
 
-  native.http_archive(
-      name = "gemmlowp",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/gemmlowp/archive/a6f29d8ac48d63293f845f2253eccbf86bc28321.tar.gz",
-          "https://github.com/google/gemmlowp/archive/a6f29d8ac48d63293f845f2253eccbf86bc28321.tar.gz",
-      ],
-      sha256 = "75d40ea8e68b0d1644f052fffe8f14a410b2a73d40ccb859a95c0578d194ec26",
-      strip_prefix = "gemmlowp-a6f29d8ac48d63293f845f2253eccbf86bc28321",
-  )
+    tf_http_archive(
+        name = "mkl_dnn",
+        build_file = clean_dep("//third_party/mkl_dnn:mkldnn.BUILD"),
+        sha256 = "363cc9239eacf8e7917753c6d8c94f767e4cd049160d0654a61ef32d5e1b3049",
+        strip_prefix = "mkl-dnn-4e333787e0d66a1dca1218e99a891d493dbc8ef1",
+        urls = [
+            "https://mirror.bazel.build/github.com/intel/mkl-dnn/archive/4e333787e0d66a1dca1218e99a891d493dbc8ef1.tar.gz",
+            "https://github.com/intel/mkl-dnn/archive/4e333787e0d66a1dca1218e99a891d493dbc8ef1.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "farmhash_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/farmhash/archive/92e897b282426729f4724d91a637596c7e2fe28f.zip",
-          "https://github.com/google/farmhash/archive/92e897b282426729f4724d91a637596c7e2fe28f.zip",
-      ],
-      sha256 = "4c626d1f306bda2c6804ab955892f803f5245f4dcaecb4979dc08b091256da54",
-      strip_prefix = "farmhash-92e897b282426729f4724d91a637596c7e2fe28f",
-      build_file = str(Label("//third_party:farmhash.BUILD")),
-  )
+    tf_http_archive(
+        name = "com_google_absl",
+        build_file = clean_dep("//third_party:com_google_absl.BUILD"),
+        sha256 = "7dd09690ae7ca4551de3111d4a86b75b23ec17445f273d3c42bdcdc1c7b02e4e",
+        strip_prefix = "abseil-cpp-48cd2c3f351ff188bc85684b84a91b6e6d17d896",
+        urls = [
+            "https://mirror.bazel.build/github.com/abseil/abseil-cpp/archive/48cd2c3f351ff188bc85684b84a91b6e6d17d896.tar.gz",
+            "https://github.com/abseil/abseil-cpp/archive/48cd2c3f351ff188bc85684b84a91b6e6d17d896.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "farmhash",
-      actual = "@farmhash//:farmhash",
-  )
+    tf_http_archive(
+        name = "eigen_archive",
+        build_file = clean_dep("//third_party:eigen.BUILD"),
+        sha256 = "d956415d784fa4e42b6a2a45c32556d6aec9d0a3d8ef48baee2522ab762556a9",
+        strip_prefix = "eigen-eigen-fd6845384b86",
+        urls = [
+            "https://mirror.bazel.build/bitbucket.org/eigen/eigen/get/fd6845384b86.tar.gz",
+            "https://bitbucket.org/eigen/eigen/get/fd6845384b86.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "highwayhash",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/highwayhash/archive/dfcb97ca4fe9277bf9dc1802dd979b071896453b.tar.gz",
-          "https://github.com/google/highwayhash/archive/dfcb97ca4fe9277bf9dc1802dd979b071896453b.tar.gz",
-      ],
-      sha256 = "0f30a15b1566d93f146c8d149878a06e91d9bb7ec2cfd76906df62a82be4aac9",
-      strip_prefix = "highwayhash-dfcb97ca4fe9277bf9dc1802dd979b071896453b",
-      build_file = str(Label("//third_party:highwayhash.BUILD")),
-  )
+    tf_http_archive(
+        name = "arm_compiler",
+        build_file = clean_dep("//:arm_compiler.BUILD"),
+        sha256 = "970285762565c7890c6c087d262b0a18286e7d0384f13a37786d8521773bc969",
+        strip_prefix = "tools-0e906ebc527eab1cdbf7adabff5b474da9562e9f/arm-bcm2708/arm-rpi-4.9.3-linux-gnueabihf",
+        urls = [
+            "https://mirror.bazel.build/github.com/raspberrypi/tools/archive/0e906ebc527eab1cdbf7adabff5b474da9562e9f.tar.gz",
+            # Please uncomment me, when the next upgrade happens. Then
+            # remove the whitelist entry in third_party/repo.bzl.
+            # "https://github.com/raspberrypi/tools/archive/0e906ebc527eab1cdbf7adabff5b474da9562e9f.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "nasm",
-      urls = [
-          "http://mirror.bazel.build/www.nasm.us/pub/nasm/releasebuilds/2.12.02/nasm-2.12.02.tar.bz2",
-          "http://pkgs.fedoraproject.org/repo/pkgs/nasm/nasm-2.12.02.tar.bz2/d15843c3fb7db39af80571ee27ec6fad/nasm-2.12.02.tar.bz2",
-      ],
-      sha256 = "00b0891c678c065446ca59bcee64719d0096d54d6886e6e472aeee2e170ae324",
-      strip_prefix = "nasm-2.12.02",
-      build_file = str(Label("//third_party:nasm.BUILD")),
-  )
+    tf_http_archive(
+        name = "libxsmm_archive",
+        build_file = clean_dep("//third_party:libxsmm.BUILD"),
+        sha256 = "cd8532021352b4a0290d209f7f9bfd7c2411e08286a893af3577a43457287bfa",
+        strip_prefix = "libxsmm-1.9",
+        urls = [
+            "https://mirror.bazel.build/github.com/hfp/libxsmm/archive/1.9.tar.gz",
+            "https://github.com/hfp/libxsmm/archive/1.9.tar.gz",
+        ],
+    )
 
-  temp_workaround_http_archive(
-      name = "jpeg",
-      urls = [
-          "http://mirror.bazel.build/github.com/libjpeg-turbo/libjpeg-turbo/archive/1.5.1.tar.gz",
-          "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/1.5.1.tar.gz",
-      ],
-      sha256 = "c15a9607892113946379ccea3ca8b85018301b200754f209453ab21674268e77",
-      strip_prefix = "libjpeg-turbo-1.5.1",
-      build_file = str(Label("//third_party/jpeg:jpeg.BUILD")),
-      repository = tf_repo_name,
-  )
+    tf_http_archive(
+        name = "ortools_archive",
+        build_file = clean_dep("//third_party:ortools.BUILD"),
+        sha256 = "d025a95f78b5fc5eaa4da5f395f23d11c23cf7dbd5069f1f627f002de87b86b9",
+        strip_prefix = "or-tools-6.7.2/src",
+        urls = [
+            "https://mirror.bazel.build/github.com/google/or-tools/archive/v6.7.2.tar.gz",
+            "https://github.com/google/or-tools/archive/v6.7.2.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "png_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/glennrp/libpng/archive/v1.2.53.zip",
-          "https://github.com/glennrp/libpng/archive/v1.2.53.zip",
-      ],
-      sha256 = "c35bcc6387495ee6e757507a68ba036d38ad05b415c2553b3debe2a57647a692",
-      strip_prefix = "libpng-1.2.53",
-      build_file = str(Label("//third_party:png.BUILD")),
-  )
+    tf_http_archive(
+        name = "com_googlesource_code_re2",
+        sha256 = "803c7811146edeef8f91064de37c6f19136ff01a2a8cdb3230e940b2fd9f07fe",
+        strip_prefix = "re2-2018-07-01",
+        system_build_file = clean_dep("//third_party/systemlibs:re2.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/google/re2/archive/2018-07-01.tar.gz",
+            "https://github.com/google/re2/archive/2018-07-01.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "gif_archive",
-      urls = [
-          "http://mirror.bazel.build/ufpr.dl.sourceforge.net/project/giflib/giflib-5.1.4.tar.gz",
-          "http://ufpr.dl.sourceforge.net/project/giflib/giflib-5.1.4.tar.gz",
-          "http://pilotfiber.dl.sourceforge.net/project/giflib/giflib-5.1.4.tar.gz",
-      ],
-      sha256 = "34a7377ba834397db019e8eb122e551a49c98f49df75ec3fcc92b9a794a4f6d1",
-      strip_prefix = "giflib-5.1.4",
-      build_file = str(Label("//third_party:gif.BUILD")),
-  )
+    tf_http_archive(
+        name = "com_github_googlecloudplatform_google_cloud_cpp",
+        sha256 = "fdd3b3aecce60987e5525e55bf3a21d68a8695320bd5b980775af6507eec3944",
+        strip_prefix = "google-cloud-cpp-14760a86c4ffab9943b476305c4fe927ad95db1c",
+        system_build_file = clean_dep("//third_party/systemlibs:google_cloud_cpp.BUILD"),
+        system_link_files = {
+            "//third_party/systemlibs:google_cloud_cpp.google.cloud.bigtable.BUILD": "google/cloud/bigtable/BUILD",
+        },
+        urls = [
+            "https://mirror.bazel.build/github.com/GoogleCloudPlatform/google-cloud-cpp/archive/14760a86c4ffab9943b476305c4fe927ad95db1c.tar.gz",
+            "https://github.com/GoogleCloudPlatform/google-cloud-cpp/archive/14760a86c4ffab9943b476305c4fe927ad95db1c.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "six_archive",
-      urls = [
-          "http://mirror.bazel.build/pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
-          "https://pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
-      ],
-      sha256 = "105f8d68616f8248e24bf0e9372ef04d3cc10104f1980f54d57b2ce73a5ad56a",
-      strip_prefix = "six-1.10.0",
-      build_file = str(Label("//third_party:six.BUILD")),
-  )
+    tf_http_archive(
+        name = "com_github_googleapis_googleapis",
+        build_file = clean_dep("//third_party:googleapis.BUILD"),
+        sha256 = "824870d87a176f26bcef663e92051f532fac756d1a06b404055dc078425f4378",
+        strip_prefix = "googleapis-f81082ea1e2f85c43649bee26e0d9871d4b41cdb",
+        system_build_file = clean_dep("//third_party/systemlibs:googleapis.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/googleapis/googleapis/archive/f81082ea1e2f85c43649bee26e0d9871d4b41cdb.zip",
+            "https://github.com/googleapis/googleapis/archive/f81082ea1e2f85c43649bee26e0d9871d4b41cdb.zip",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "org_python_pypi_backports_weakref",
-      urls = [
-          "http://mirror.bazel.build/pypi.python.org/packages/bc/cc/3cdb0a02e7e96f6c70bd971bc8a90b8463fda83e264fa9c5c1c98ceabd81/backports.weakref-1.0rc1.tar.gz",
-          "https://pypi.python.org/packages/bc/cc/3cdb0a02e7e96f6c70bd971bc8a90b8463fda83e264fa9c5c1c98ceabd81/backports.weakref-1.0rc1.tar.gz",
-      ],
-      sha256 = "8813bf712a66b3d8b85dc289e1104ed220f1878cf981e2fe756dfaabe9a82892",
-      strip_prefix = "backports.weakref-1.0rc1/src",
-      build_file = str(Label("//third_party:backports_weakref.BUILD")),
-  )
+    tf_http_archive(
+        name = "gemmlowp",
+        sha256 = "b87faa7294dfcc5d678f22a59d2c01ca94ea1e2a3b488c38a95a67889ed0a658",
+        strip_prefix = "gemmlowp-38ebac7b059e84692f53e5938f97a9943c120d98",
+        urls = [
+            "https://mirror.bazel.build/github.com/google/gemmlowp/archive/38ebac7b059e84692f53e5938f97a9943c120d98.zip",
+            "https://github.com/google/gemmlowp/archive/38ebac7b059e84692f53e5938f97a9943c120d98.zip",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "com_github_andreif_codegen",
-      urls = [
-          "http://mirror.bazel.build/github.com/andreif/codegen/archive/1.0.tar.gz",
-          "https://github.com/andreif/codegen/archive/1.0.tar.gz",
-      ],
-      sha256 = "2dadd04a2802de27e0fe5a19b76538f6da9d39ff244036afa00c1bba754de5ee",
-      strip_prefix = "codegen-1.0",
-      build_file = str(Label("//third_party:codegen.BUILD")),
-  )
+    tf_http_archive(
+        name = "farmhash_archive",
+        build_file = clean_dep("//third_party:farmhash.BUILD"),
+        sha256 = "6560547c63e4af82b0f202cb710ceabb3f21347a4b996db565a411da5b17aba0",
+        strip_prefix = "farmhash-816a4ae622e964763ca0862d9dbd19324a1eaf45",
+        urls = [
+            "https://mirror.bazel.build/github.com/google/farmhash/archive/816a4ae622e964763ca0862d9dbd19324a1eaf45.tar.gz",
+            "https://github.com/google/farmhash/archive/816a4ae622e964763ca0862d9dbd19324a1eaf45.tar.gz",
+        ],
+    )
 
-  filegroup_external(
-      name = "org_python_license",
-      licenses = ["notice"],  # Python 2.0
-      sha256_urls = {
-          "b5556e921715ddb9242c076cae3963f483aa47266c5e37ea4c187f77cc79501c": [
-              "http://mirror.bazel.build/docs.python.org/2.7/_sources/license.txt",
-              "https://docs.python.org/2.7/_sources/license.txt",
-          ],
-      },
-  )
+    tf_http_archive(
+        name = "highwayhash",
+        build_file = clean_dep("//third_party:highwayhash.BUILD"),
+        sha256 = "9c3e0e87d581feeb0c18d814d98f170ff23e62967a2bd6855847f0b2fe598a37",
+        strip_prefix = "highwayhash-fd3d9af80465e4383162e4a7c5e2f406e82dd968",
+        urls = [
+            "http://mirror.bazel.build/github.com/google/highwayhash/archive/fd3d9af80465e4383162e4a7c5e2f406e82dd968.tar.gz",
+            "https://github.com/google/highwayhash/archive/fd3d9af80465e4383162e4a7c5e2f406e82dd968.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "six",
-      actual = "@six_archive//:six",
-  )
+    tf_http_archive(
+        name = "nasm",
+        build_file = clean_dep("//third_party:nasm.BUILD"),
+        sha256 = "63ec86477ad3f0f6292325fd89e1d93aea2e2fd490070863f17d48f7cd387011",
+        strip_prefix = "nasm-2.13.03",
+        system_build_file = clean_dep("//third_party/systemlibs:nasm.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/www.nasm.us/pub/nasm/releasebuilds/2.13.03/nasm-2.13.03.tar.bz2",
+            "http://pkgs.fedoraproject.org/repo/pkgs/nasm/nasm-2.13.03.tar.bz2/sha512/d7a6b4cee8dfd603d8d4c976e5287b5cc542fa0b466ff989b743276a6e28114e64289bf02a7819eca63142a5278aa6eed57773007e5f589e15768e6456a8919d/nasm-2.13.03.tar.bz2",
+            "http://www.nasm.us/pub/nasm/releasebuilds/2.13.03/nasm-2.13.03.tar.bz2",
+        ],
+    )
 
-  patched_http_archive(
-      name = "protobuf",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/protobuf/archive/v3.3.1.tar.gz",
-          "https://github.com/google/protobuf/archive/v3.3.1.tar.gz",
-      ],
-      sha256 = "30f23a45c6f4515598702a6d19c4295ba92c4a635d7ad8d331a4db9fccff392d",
-      strip_prefix = "protobuf-3.3.1",
-      # TODO: remove patching when tensorflow stops linking same protos into
-      #       multiple shared libraries loaded in runtime by python.
-      #       This patch fixes a runtime crash when tensorflow is compiled
-      #       with clang -O2 on Linux (see https://github.com/tensorflow/tensorflow/issues/8394)
-      patch_file = str(Label("//third_party/protobuf:add_noinlines.patch")),
-  )
+    tf_http_archive(
+        name = "jpeg",
+        build_file = clean_dep("//third_party/jpeg:jpeg.BUILD"),
+        sha256 = "f892fff427ab3adffc289363eac26d197ce3ccacefe5f5822377348a8166069b",
+        strip_prefix = "libjpeg-turbo-2.0.0",
+        system_build_file = clean_dep("//third_party/systemlibs:jpeg.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/libjpeg-turbo/libjpeg-turbo/archive/2.0.0.tar.gz",
+            "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/2.0.0.tar.gz",
+        ],
+    )
 
-  # We need to import the protobuf library under the names com_google_protobuf
-  # and com_google_protobuf_cc to enable proto_library support in bazel.
-  # Unfortunately there is no way to alias http_archives at the moment.
-  native.http_archive(
-      name = "com_google_protobuf",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/protobuf/archive/v3.3.1.tar.gz",
-          "https://github.com/google/protobuf/archive/v3.3.1.tar.gz",
-      ],
-      sha256 = "30f23a45c6f4515598702a6d19c4295ba92c4a635d7ad8d331a4db9fccff392d",
-      strip_prefix = "protobuf-3.3.1",
-  )
+    tf_http_archive(
+        name = "png_archive",
+        build_file = clean_dep("//third_party:png.BUILD"),
+        patch_file = clean_dep("//third_party:png_fix_rpi.patch"),
+        sha256 = "e45ce5f68b1d80e2cb9a2b601605b374bdf51e1798ef1c2c2bd62131dfcf9eef",
+        strip_prefix = "libpng-1.6.34",
+        system_build_file = clean_dep("//third_party/systemlibs:png.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/glennrp/libpng/archive/v1.6.34.tar.gz",
+            "https://github.com/glennrp/libpng/archive/v1.6.34.tar.gz",
+        ],
+    )
 
-  native.http_archive(
-      name = "com_google_protobuf_cc",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/protobuf/archive/v3.3.1.tar.gz",
-          "https://github.com/google/protobuf/archive/v3.3.1.tar.gz",
-      ],
-      sha256 = "30f23a45c6f4515598702a6d19c4295ba92c4a635d7ad8d331a4db9fccff392d",
-      strip_prefix = "protobuf-3.3.1",
-  )
+    tf_http_archive(
+        name = "org_sqlite",
+        build_file = clean_dep("//third_party:sqlite.BUILD"),
+        sha256 = "ad68c1216c3a474cf360c7581a4001e952515b3649342100f2d7ca7c8e313da6",
+        strip_prefix = "sqlite-amalgamation-3240000",
+        system_build_file = clean_dep("//third_party/systemlibs:sqlite.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/www.sqlite.org/2018/sqlite-amalgamation-3240000.zip",
+            "https://www.sqlite.org/2018/sqlite-amalgamation-3240000.zip",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "gmock_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/googletest/archive/release-1.8.0.zip",
-          "https://github.com/google/googletest/archive/release-1.8.0.zip",
-      ],
-      sha256 = "f3ed3b58511efd272eb074a3a6d6fb79d7c2e6a0e374323d1e6bcbcc1ef141bf",
-      strip_prefix = "googletest-release-1.8.0",
-      build_file = str(Label("//third_party:gmock.BUILD")),
-  )
+    tf_http_archive(
+        name = "gif_archive",
+        build_file = clean_dep("//third_party:gif.BUILD"),
+        sha256 = "34a7377ba834397db019e8eb122e551a49c98f49df75ec3fcc92b9a794a4f6d1",
+        strip_prefix = "giflib-5.1.4",
+        system_build_file = clean_dep("//third_party/systemlibs:gif.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/ufpr.dl.sourceforge.net/project/giflib/giflib-5.1.4.tar.gz",
+            "http://pilotfiber.dl.sourceforge.net/project/giflib/giflib-5.1.4.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "gtest",
-      actual = "@gmock_archive//:gtest",
-  )
+    tf_http_archive(
+        name = "six_archive",
+        build_file = clean_dep("//third_party:six.BUILD"),
+        sha256 = "105f8d68616f8248e24bf0e9372ef04d3cc10104f1980f54d57b2ce73a5ad56a",
+        strip_prefix = "six-1.10.0",
+        system_build_file = clean_dep("//third_party/systemlibs:six.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
+            "https://pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "gtest_main",
-      actual = "@gmock_archive//:gtest_main",
-  )
+    tf_http_archive(
+        name = "astor_archive",
+        build_file = clean_dep("//third_party:astor.BUILD"),
+        sha256 = "ff6d2e2962d834acb125cc4dcc80c54a8c17c253f4cc9d9c43b5102a560bb75d",
+        strip_prefix = "astor-0.6.2",
+        system_build_file = clean_dep("//third_party/systemlibs:astor.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/pypi.python.org/packages/d8/be/c4276b3199ec3feee2a88bc64810fbea8f26d961e0a4cd9c68387a9f35de/astor-0.6.2.tar.gz",
+            "https://pypi.python.org/packages/d8/be/c4276b3199ec3feee2a88bc64810fbea8f26d961e0a4cd9c68387a9f35de/astor-0.6.2.tar.gz",
+        ],
+    )
 
-  native.http_archive(
-      name = "com_github_gflags_gflags",
-      urls = [
-          "http://mirror.bazel.build/github.com/gflags/gflags/archive/f8a0efe03aa69b3336d8e228b37d4ccb17324b88.tar.gz",
-          "https://github.com/gflags/gflags/archive/f8a0efe03aa69b3336d8e228b37d4ccb17324b88.tar.gz",
-      ],
-      sha256 = "4d222fab8f1ede4709cdff417d15a1336f862d7334a81abf76d09c15ecf9acd1",
-      strip_prefix = "gflags-f8a0efe03aa69b3336d8e228b37d4ccb17324b88",
-  )
+    tf_http_archive(
+        name = "gast_archive",
+        build_file = clean_dep("//third_party:gast.BUILD"),
+        sha256 = "7068908321ecd2774f145193c4b34a11305bd104b4551b09273dfd1d6a374930",
+        strip_prefix = "gast-0.2.0",
+        system_build_file = clean_dep("//third_party/systemlibs:gast.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/pypi.python.org/packages/5c/78/ff794fcae2ce8aa6323e789d1f8b3b7765f601e7702726f430e814822b96/gast-0.2.0.tar.gz",
+            "https://pypi.python.org/packages/5c/78/ff794fcae2ce8aa6323e789d1f8b3b7765f601e7702726f430e814822b96/gast-0.2.0.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "python_headers",
-      actual = str(Label("//util/python:python_headers")),
-  )
+    tf_http_archive(
+        name = "termcolor_archive",
+        build_file = clean_dep("//third_party:termcolor.BUILD"),
+        sha256 = "1d6d69ce66211143803fbc56652b41d73b4a400a2891d7bf7a1cdf4c02de613b",
+        strip_prefix = "termcolor-1.1.0",
+        system_build_file = clean_dep("//third_party/systemlibs:termcolor.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/pypi.python.org/packages/8a/48/a76be51647d0eb9f10e2a4511bf3ffb8cc1e6b14e9e4fab46173aa79f981/termcolor-1.1.0.tar.gz",
+            "https://pypi.python.org/packages/8a/48/a76be51647d0eb9f10e2a4511bf3ffb8cc1e6b14e9e4fab46173aa79f981/termcolor-1.1.0.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "pcre",
-      sha256 = "ccdf7e788769838f8285b3ee672ed573358202305ee361cfec7a4a4fb005bbc7",
-      urls = [
-          "http://mirror.bazel.build/ftp.exim.org/pub/pcre/pcre-8.39.tar.gz",
-          "http://ftp.exim.org/pub/pcre/pcre-8.39.tar.gz",
-      ],
-      strip_prefix = "pcre-8.39",
-      build_file = str(Label("//third_party:pcre.BUILD")),
-  )
+    tf_http_archive(
+        name = "absl_py",
+        sha256 = "95160f778a62c7a60ddeadc7bf2d83f85a23a27359814aca12cf949e896fa82c",
+        strip_prefix = "abseil-py-pypi-v0.2.2",
+        system_build_file = clean_dep("//third_party/systemlibs:absl_py.BUILD"),
+        system_link_files = {
+            "//third_party/systemlibs:absl_py.absl.flags.BUILD": "absl/flags/BUILD",
+            "//third_party/systemlibs:absl_py.absl.testing.BUILD": "absl/testing/BUILD",
+        },
+        urls = [
+            "https://mirror.bazel.build/github.com/abseil/abseil-py/archive/pypi-v0.2.2.tar.gz",
+            "https://github.com/abseil/abseil-py/archive/pypi-v0.2.2.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "swig",
-      sha256 = "58a475dbbd4a4d7075e5fe86d4e54c9edde39847cdb96a3053d87cb64a23a453",
-      urls = [
-          "http://mirror.bazel.build/ufpr.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
-          "http://ufpr.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
-          "http://pilotfiber.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
-      ],
-      strip_prefix = "swig-3.0.8",
-      build_file = str(Label("//third_party:swig.BUILD")),
-  )
+    tf_http_archive(
+        name = "org_python_pypi_backports_weakref",
+        build_file = clean_dep("//third_party:backports_weakref.BUILD"),
+        sha256 = "8813bf712a66b3d8b85dc289e1104ed220f1878cf981e2fe756dfaabe9a82892",
+        strip_prefix = "backports.weakref-1.0rc1/src",
+        urls = [
+            "https://mirror.bazel.build/pypi.python.org/packages/bc/cc/3cdb0a02e7e96f6c70bd971bc8a90b8463fda83e264fa9c5c1c98ceabd81/backports.weakref-1.0rc1.tar.gz",
+            "https://pypi.python.org/packages/bc/cc/3cdb0a02e7e96f6c70bd971bc8a90b8463fda83e264fa9c5c1c98ceabd81/backports.weakref-1.0rc1.tar.gz",
+        ],
+    )
 
-  temp_workaround_http_archive(
-      name = "curl",
-      sha256 = "ff3e80c1ca6a068428726cd7dd19037a47cc538ce58ef61c59587191039b2ca6",
-      urls = [
-          "http://mirror.bazel.build/curl.haxx.se/download/curl-7.49.1.tar.gz",
-          "https://curl.haxx.se/download/curl-7.49.1.tar.gz",
-      ],
-      strip_prefix = "curl-7.49.1",
-      build_file = str(Label("//third_party:curl.BUILD")),
-      repository = tf_repo_name
-  )
+    filegroup_external(
+        name = "org_python_license",
+        licenses = ["notice"],  # Python 2.0
+        sha256_urls = {
+            "b5556e921715ddb9242c076cae3963f483aa47266c5e37ea4c187f77cc79501c": [
+                "https://mirror.bazel.build/docs.python.org/2.7/_sources/license.txt",
+                "https://docs.python.org/2.7/_sources/license.txt",
+            ],
+        },
+    )
 
-  # grpc expects //external:protobuf_clib and //external:protobuf_compiler
-  # to point to the protobuf's compiler library.
-  native.bind(
-      name = "protobuf_clib",
-      actual = "@protobuf//:protoc_lib",
-  )
+    PROTOBUF_URLS = [
+        "https://mirror.bazel.build/github.com/google/protobuf/archive/v3.6.0.tar.gz",
+        "https://github.com/google/protobuf/archive/v3.6.0.tar.gz",
+    ]
+    PROTOBUF_SHA256 = "50a5753995b3142627ac55cfd496cebc418a2e575ca0236e29033c67bd5665f4"
+    PROTOBUF_STRIP_PREFIX = "protobuf-3.6.0"
 
-  native.bind(
-      name = "protobuf_compiler",
-      actual = "@protobuf//:protoc_lib",
-  )
+    tf_http_archive(
+        name = "protobuf_archive",
+        sha256 = PROTOBUF_SHA256,
+        strip_prefix = PROTOBUF_STRIP_PREFIX,
+        urls = PROTOBUF_URLS,
+    )
 
-  native.new_http_archive(
-      name = "grpc",
-      urls = [
-          "http://mirror.bazel.build/github.com/grpc/grpc/archive/d7ff4ff40071d2b486a052183e3e9f9382afb745.tar.gz",
-          "https://github.com/grpc/grpc/archive/d7ff4ff40071d2b486a052183e3e9f9382afb745.tar.gz",
-      ],
-      sha256 = "a15f352436ab92c521b1ac11e729e155ace38d0856380cf25048c5d1d9ba8e31",
-      strip_prefix = "grpc-d7ff4ff40071d2b486a052183e3e9f9382afb745",
-      build_file = str(Label("//third_party:grpc.BUILD")),
-  )
+    # We need to import the protobuf library under the names com_google_protobuf
+    # and com_google_protobuf_cc to enable proto_library support in bazel.
+    # Unfortunately there is no way to alias http_archives at the moment.
+    tf_http_archive(
+        name = "com_google_protobuf",
+        sha256 = PROTOBUF_SHA256,
+        strip_prefix = PROTOBUF_STRIP_PREFIX,
+        urls = PROTOBUF_URLS,
+    )
 
-  # protobuf expects //external:grpc_cpp_plugin to point to grpc's
-  # C++ plugin code generator.
-  native.bind(
-      name = "grpc_cpp_plugin",
-      actual = "@grpc//:grpc_cpp_plugin",
-  )
+    tf_http_archive(
+        name = "com_google_protobuf_cc",
+        sha256 = PROTOBUF_SHA256,
+        strip_prefix = PROTOBUF_STRIP_PREFIX,
+        urls = PROTOBUF_URLS,
+    )
 
-  native.bind(
-      name = "grpc_lib",
-      actual = "@grpc//:grpc++_unsecure",
-  )
+    tf_http_archive(
+        name = "nsync",
+        sha256 = "692f9b30e219f71a6371b98edd39cef3cbda35ac3abc4cd99ce19db430a5591a",
+        strip_prefix = "nsync-1.20.1",
+        system_build_file = clean_dep("//third_party/systemlibs:nsync.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/google/nsync/archive/1.20.1.tar.gz",
+            "https://github.com/google/nsync/archive/1.20.1.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "linenoise",
-      sha256 = "7f51f45887a3d31b4ce4fa5965210a5e64637ceac12720cfce7954d6a2e812f7",
-      urls = [
-          "http://mirror.bazel.build/github.com/antirez/linenoise/archive/c894b9e59f02203dbe4e2be657572cf88c4230c3.tar.gz",
-          "https://github.com/antirez/linenoise/archive/c894b9e59f02203dbe4e2be657572cf88c4230c3.tar.gz",
-      ],
-      strip_prefix = "linenoise-c894b9e59f02203dbe4e2be657572cf88c4230c3",
-      build_file = str(Label("//third_party:linenoise.BUILD")),
-  )
+    tf_http_archive(
+        name = "com_google_googletest",
+        sha256 = "353ab86e35cea1cd386115279cf4b16695bbf21b897bfbf2721cf4cb5f64ade8",
+        strip_prefix = "googletest-997d343dd680e541ef96ce71ee54a91daf2577a0",
+        urls = [
+            "https://mirror.bazel.build/github.com/google/googletest/archive/997d343dd680e541ef96ce71ee54a91daf2577a0.zip",
+            "https://github.com/google/googletest/archive/997d343dd680e541ef96ce71ee54a91daf2577a0.zip",
+        ],
+    )
 
-  # TODO(phawkins): currently, this rule uses an unofficial LLVM mirror.
-  # Switch to an official source of snapshots if/when possible.
-  temp_workaround_http_archive(
-      name = "llvm",
-      urls = [
-          "http://mirror.bazel.build/github.com/llvm-mirror/llvm/archive/e156d99231a7735d06a97b5b83de70bf4ce4f034.tar.gz",
-          "https://github.com/llvm-mirror/llvm/archive/e156d99231a7735d06a97b5b83de70bf4ce4f034.tar.gz",
-      ],
-      sha256 = "72e34e2411a06d4200a2688ee83832805fbef23a12ea481f31c2b8866fde007a",
-      strip_prefix = "llvm-e156d99231a7735d06a97b5b83de70bf4ce4f034",
-      build_file = str(Label("//third_party/llvm:llvm.BUILD")),
-      repository = tf_repo_name,
-  )
+    tf_http_archive(
+        name = "com_github_gflags_gflags",
+        sha256 = "ae27cdbcd6a2f935baa78e4f21f675649271634c092b1be01469440495609d0e",
+        strip_prefix = "gflags-2.2.1",
+        urls = [
+            "https://mirror.bazel.build/github.com/gflags/gflags/archive/v2.2.1.tar.gz",
+            "https://github.com/gflags/gflags/archive/v2.2.1.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-    name = "lmdb",
-    urls = [
-      "http://mirror.bazel.build/github.com/LMDB/lmdb/archive/LMDB_0.9.19.tar.gz",
-      "https://github.com/LMDB/lmdb/archive/LMDB_0.9.19.tar.gz",
-    ],
-    sha256 = "108532fb94c6f227558d45be3f3347b52539f0f58290a7bb31ec06c462d05326",
-    strip_prefix = "lmdb-LMDB_0.9.19/libraries/liblmdb",
-    build_file = str(Label("//third_party:lmdb.BUILD")),
-  )
+    tf_http_archive(
+        name = "pcre",
+        build_file = clean_dep("//third_party:pcre.BUILD"),
+        sha256 = "69acbc2fbdefb955d42a4c606dfde800c2885711d2979e356c0636efde9ec3b5",
+        strip_prefix = "pcre-8.42",
+        system_build_file = clean_dep("//third_party/systemlibs:pcre.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/ftp.exim.org/pub/pcre/pcre-8.42.tar.gz",
+            "http://ftp.exim.org/pub/pcre/pcre-8.42.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "jsoncpp_git",
-      urls = [
-          "http://mirror.bazel.build/github.com/open-source-parsers/jsoncpp/archive/11086dd6a7eba04289944367ca82cea71299ed70.tar.gz",
-          "https://github.com/open-source-parsers/jsoncpp/archive/11086dd6a7eba04289944367ca82cea71299ed70.tar.gz",
-      ],
-      sha256 = "07d34db40593d257324ec5fb9debc4dc33f29f8fb44e33a2eeb35503e61d0fe2",
-      strip_prefix = "jsoncpp-11086dd6a7eba04289944367ca82cea71299ed70",
-      build_file = str(Label("//third_party:jsoncpp.BUILD")),
-  )
+    tf_http_archive(
+        name = "swig",
+        build_file = clean_dep("//third_party:swig.BUILD"),
+        sha256 = "58a475dbbd4a4d7075e5fe86d4e54c9edde39847cdb96a3053d87cb64a23a453",
+        strip_prefix = "swig-3.0.8",
+        system_build_file = clean_dep("//third_party/systemlibs:swig.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/ufpr.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
+            "http://ufpr.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
+            "http://pilotfiber.dl.sourceforge.net/project/swig/swig/swig-3.0.8/swig-3.0.8.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "jsoncpp",
-      actual = "@jsoncpp_git//:jsoncpp",
-  )
+    tf_http_archive(
+        name = "curl",
+        build_file = clean_dep("//third_party:curl.BUILD"),
+        sha256 = "e9c37986337743f37fd14fe8737f246e97aec94b39d1b71e8a5973f72a9fc4f5",
+        strip_prefix = "curl-7.60.0",
+        system_build_file = clean_dep("//third_party/systemlibs:curl.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/curl.haxx.se/download/curl-7.60.0.tar.gz",
+            "https://curl.haxx.se/download/curl-7.60.0.tar.gz",
+        ],
+    )
 
-  native.http_archive(
-      name = "boringssl",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/boringssl/archive/bbcaa15b0647816b9a1a9b9e0d209cd6712f0105.tar.gz",
-          "https://github.com/google/boringssl/archive/bbcaa15b0647816b9a1a9b9e0d209cd6712f0105.tar.gz",  # 2016-07-11
-      ],
-      sha256 = "025264d6e9a7ad371f2f66d17a28b6627de0c9592dc2eb54afd062f68f1f9aa3",
-      strip_prefix = "boringssl-bbcaa15b0647816b9a1a9b9e0d209cd6712f0105",
-  )
+    tf_http_archive(
+        name = "grpc",
+        sha256 = "50db9cf2221354485eb7c3bd55a4c27190caef7048a2a1a15fbe60a498f98b44",
+        strip_prefix = "grpc-1.13.0",
+        system_build_file = clean_dep("//third_party/systemlibs:grpc.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/grpc/grpc/archive/v1.13.0.tar.gz",
+            "https://github.com/grpc/grpc/archive/v1.13.0.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "nanopb_git",
-      urls = [
-          "http://mirror.bazel.build/github.com/nanopb/nanopb/archive/1251fa1065afc0d62f635e0f63fec8276e14e13c.tar.gz",
-          "https://github.com/nanopb/nanopb/archive/1251fa1065afc0d62f635e0f63fec8276e14e13c.tar.gz",
-      ],
-      sha256 = "ab1455c8edff855f4f55b68480991559e51c11e7dab060bbab7cffb12dd3af33",
-      strip_prefix = "nanopb-1251fa1065afc0d62f635e0f63fec8276e14e13c",
-      build_file = str(Label("//third_party:nanopb.BUILD")),
-  )
+    tf_http_archive(
+        name = "linenoise",
+        build_file = clean_dep("//third_party:linenoise.BUILD"),
+        sha256 = "7f51f45887a3d31b4ce4fa5965210a5e64637ceac12720cfce7954d6a2e812f7",
+        strip_prefix = "linenoise-c894b9e59f02203dbe4e2be657572cf88c4230c3",
+        urls = [
+            "https://mirror.bazel.build/github.com/antirez/linenoise/archive/c894b9e59f02203dbe4e2be657572cf88c4230c3.tar.gz",
+            "https://github.com/antirez/linenoise/archive/c894b9e59f02203dbe4e2be657572cf88c4230c3.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "nanopb",
-      actual = "@nanopb_git//:nanopb",
-  )
+    # TODO(phawkins): currently, this rule uses an unofficial LLVM mirror.
+    # Switch to an official source of snapshots if/when possible.
+    tf_http_archive(
+        name = "llvm",
+        build_file = clean_dep("//third_party/llvm:llvm.autogenerated.BUILD"),
+        sha256 = "a4f8bfe7e3e69069934a87e612a1d4d3b8b6af13e0f1213a42a6046e1bcd50d8",
+        strip_prefix = "llvm-d3429e96fe1e45b1dc0106463832523f37faf271",
+        urls = [
+            "https://mirror.bazel.build/github.com/llvm-mirror/llvm/archive/d3429e96fe1e45b1dc0106463832523f37faf271.tar.gz",
+            "https://github.com/llvm-mirror/llvm/archive/d3429e96fe1e45b1dc0106463832523f37faf271.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "zlib_archive",
-      urls = [
-          "http://mirror.bazel.build/zlib.net/zlib-1.2.8.tar.gz",
-          "http://zlib.net/fossils/zlib-1.2.8.tar.gz",
-      ],
-      sha256 = "36658cb768a54c1d4dec43c3116c27ed893e88b02ecfcb44f2166f9c0b7f2a0d",
-      strip_prefix = "zlib-1.2.8",
-      build_file = str(Label("//third_party:zlib.BUILD")),
-  )
+    tf_http_archive(
+        name = "lmdb",
+        build_file = clean_dep("//third_party:lmdb.BUILD"),
+        sha256 = "f3927859882eb608868c8c31586bb7eb84562a40a6bf5cc3e13b6b564641ea28",
+        strip_prefix = "lmdb-LMDB_0.9.22/libraries/liblmdb",
+        system_build_file = clean_dep("//third_party/systemlibs:lmdb.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/LMDB/lmdb/archive/LMDB_0.9.22.tar.gz",
+            "https://github.com/LMDB/lmdb/archive/LMDB_0.9.22.tar.gz",
+        ],
+    )
 
-  native.bind(
-      name = "zlib",
-      actual = "@zlib_archive//:zlib",
-  )
+    tf_http_archive(
+        name = "jsoncpp_git",
+        build_file = clean_dep("//third_party:jsoncpp.BUILD"),
+        sha256 = "c49deac9e0933bcb7044f08516861a2d560988540b23de2ac1ad443b219afdb6",
+        strip_prefix = "jsoncpp-1.8.4",
+        system_build_file = clean_dep("//third_party/systemlibs:jsoncpp.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/open-source-parsers/jsoncpp/archive/1.8.4.tar.gz",
+            "https://github.com/open-source-parsers/jsoncpp/archive/1.8.4.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "fft2d",
-      urls = [
-          "http://mirror.bazel.build/www.kurims.kyoto-u.ac.jp/~ooura/fft.tgz",
-          "http://www.kurims.kyoto-u.ac.jp/~ooura/fft.tgz",
-      ],
-      sha256 = "52bb637c70b971958ec79c9c8752b1df5ff0218a4db4510e60826e0cb79b5296",
-      build_file = str(Label("//third_party/fft2d:fft2d.BUILD")),
-  )
+    tf_http_archive(
+        name = "boringssl",
+        sha256 = "1188e29000013ed6517168600fc35a010d58c5d321846d6a6dfee74e4c788b45",
+        strip_prefix = "boringssl-7f634429a04abc48e2eb041c81c5235816c96514",
+        system_build_file = clean_dep("//third_party/systemlibs:boringssl.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/google/boringssl/archive/7f634429a04abc48e2eb041c81c5235816c96514.tar.gz",
+            "https://github.com/google/boringssl/archive/7f634429a04abc48e2eb041c81c5235816c96514.tar.gz",
+        ],
+    )
 
-  temp_workaround_http_archive(
-      name = "snappy",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/snappy/archive/1.1.4.zip",
-          "https://github.com/google/snappy/archive/1.1.4.zip",
-      ],
-      sha256 = "6c74d2b663170d68184da353cdd71b5b7d57bc8888ef1e99b4929b5d680dba54",
-      strip_prefix = "snappy-1.1.4",
-      build_file = str(Label("//third_party:snappy.BUILD")),
-      repository = tf_repo_name,
-  )
+    tf_http_archive(
+        name = "zlib_archive",
+        build_file = clean_dep("//third_party:zlib.BUILD"),
+        sha256 = "c3e5e9fdd5004dcb542feda5ee4f0ff0744628baf8ed2dd5d66f8ca1197cb1a1",
+        strip_prefix = "zlib-1.2.11",
+        system_build_file = clean_dep("//third_party/systemlibs:zlib.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/zlib.net/zlib-1.2.11.tar.gz",
+            "https://zlib.net/zlib-1.2.11.tar.gz",
+        ],
+    )
 
-  temp_workaround_http_archive(
-      name = "nccl_archive",
-      urls = [
-          "http://mirror.bazel.build/github.com/nvidia/nccl/archive/ccfc4567dc3e2a37fb42cfbc64d10eb526e7da7b.tar.gz",
-          "https://github.com/nvidia/nccl/archive/ccfc4567dc3e2a37fb42cfbc64d10eb526e7da7b.tar.gz",
-      ],
-      sha256 = "6c34a0862d9f8ed4ad5984c6a8206b351957bb14cf6ad7822720f285f4aada04",
-      strip_prefix = "nccl-ccfc4567dc3e2a37fb42cfbc64d10eb526e7da7b",
-      build_file = str(Label("//third_party:nccl.BUILD")),
-      repository = tf_repo_name,
-  )
+    tf_http_archive(
+        name = "fft2d",
+        build_file = clean_dep("//third_party/fft2d:fft2d.BUILD"),
+        sha256 = "52bb637c70b971958ec79c9c8752b1df5ff0218a4db4510e60826e0cb79b5296",
+        urls = [
+            "https://mirror.bazel.build/www.kurims.kyoto-u.ac.jp/~ooura/fft.tgz",
+            "http://www.kurims.kyoto-u.ac.jp/~ooura/fft.tgz",
+        ],
+    )
 
-  java_import_external(
-      name = "junit",
-      jar_sha256 = "59721f0805e223d84b90677887d9ff567dc534d7c502ca903c0c2b17f05c116a",
-      jar_urls = [
-          "http://mirror.bazel.build/repo1.maven.org/maven2/junit/junit/4.12/junit-4.12.jar",
-          "http://repo1.maven.org/maven2/junit/junit/4.12/junit-4.12.jar",
-          "http://maven.ibiblio.org/maven2/junit/junit/4.12/junit-4.12.jar",
-      ],
-      licenses = ["reciprocal"],  # Common Public License Version 1.0
-      testonly_ = True,
-      deps = ["@org_hamcrest_core"],
-  )
+    tf_http_archive(
+        name = "snappy",
+        build_file = clean_dep("//third_party:snappy.BUILD"),
+        sha256 = "3dfa02e873ff51a11ee02b9ca391807f0c8ea0529a4924afa645fbf97163f9d4",
+        strip_prefix = "snappy-1.1.7",
+        system_build_file = clean_dep("//third_party/systemlibs:snappy.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/google/snappy/archive/1.1.7.tar.gz",
+            "https://github.com/google/snappy/archive/1.1.7.tar.gz",
+        ],
+    )
 
-  java_import_external(
-      name = "org_hamcrest_core",
-      jar_sha256 = "66fdef91e9739348df7a096aa384a5685f4e875584cce89386a7a47251c4d8e9",
-      jar_urls = [
-          "http://mirror.bazel.build/repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
-          "http://repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
-          "http://maven.ibiblio.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
-      ],
-      licenses = ["notice"],  # New BSD License
-      testonly_ = True,
-  )
+    tf_http_archive(
+        name = "nccl_archive",
+        build_file = clean_dep("//third_party:nccl/nccl_archive.BUILD"),
+        sha256 = "2ca86fb6179ecbff789cc67c836139c1bbc0324ed8c04643405a30bf26325176",
+        strip_prefix = "nccl-03d856977ecbaac87e598c0c4bafca96761b9ac7",
+        urls = [
+            "https://mirror.bazel.build/github.com/nvidia/nccl/archive/03d856977ecbaac87e598c0c4bafca96761b9ac7.tar.gz",
+            "https://github.com/nvidia/nccl/archive/03d856977ecbaac87e598c0c4bafca96761b9ac7.tar.gz",
+        ],
+    )
 
-  temp_workaround_http_archive(
-      name = "jemalloc",
-      urls = [
-          "http://mirror.bazel.build/github.com/jemalloc/jemalloc/archive/4.4.0.tar.gz",
-          "https://github.com/jemalloc/jemalloc/archive/4.4.0.tar.gz",
-      ],
-      sha256 = "3c8f25c02e806c3ce0ab5fb7da1817f89fc9732709024e2a81b6b82f7cc792a8",
-      strip_prefix = "jemalloc-4.4.0",
-      build_file = str(Label("//third_party:jemalloc.BUILD")),
-      repository = tf_repo_name,
-  )
+    tf_http_archive(
+        name = "kafka",
+        build_file = clean_dep("//third_party:kafka/BUILD"),
+        patch_file = clean_dep("//third_party/kafka:config.patch"),
+        sha256 = "cc6ebbcd0a826eec1b8ce1f625ffe71b53ef3290f8192b6cae38412a958f4fd3",
+        strip_prefix = "librdkafka-0.11.5",
+        urls = [
+            "https://mirror.bazel.build/github.com/edenhill/librdkafka/archive/v0.11.5.tar.gz",
+            "https://github.com/edenhill/librdkafka/archive/v0.11.5.tar.gz",
+        ],
+    )
 
-  native.new_http_archive(
-      name = "com_google_pprof",
-      urls = [
-          "http://mirror.bazel.build/github.com/google/pprof/archive/c0fb62ec88c411cc91194465e54db2632845b650.tar.gz",
-          "https://github.com/google/pprof/archive/c0fb62ec88c411cc91194465e54db2632845b650.tar.gz",
-      ],
-      sha256 = "e0928ca4aa10ea1e0551e2d7ce4d1d7ea2d84b2abbdef082b0da84268791d0c4",
-      strip_prefix = "pprof-c0fb62ec88c411cc91194465e54db2632845b650",
-      build_file = str(Label("//third_party:pprof.BUILD")),
-  )
+    tf_http_archive(
+        name = "aws",
+        build_file = clean_dep("//third_party:aws.BUILD"),
+        sha256 = "b888d8ce5fc10254c3dd6c9020c7764dd53cf39cf011249d0b4deda895de1b7c",
+        strip_prefix = "aws-sdk-cpp-1.3.15",
+        urls = [
+            "https://mirror.bazel.build/github.com/aws/aws-sdk-cpp/archive/1.3.15.tar.gz",
+            "https://github.com/aws/aws-sdk-cpp/archive/1.3.15.tar.gz",
+        ],
+    )
+
+    java_import_external(
+        name = "junit",
+        jar_sha256 = "59721f0805e223d84b90677887d9ff567dc534d7c502ca903c0c2b17f05c116a",
+        jar_urls = [
+            "https://mirror.bazel.build/repo1.maven.org/maven2/junit/junit/4.12/junit-4.12.jar",
+            "http://repo1.maven.org/maven2/junit/junit/4.12/junit-4.12.jar",
+            "http://maven.ibiblio.org/maven2/junit/junit/4.12/junit-4.12.jar",
+        ],
+        licenses = ["reciprocal"],  # Common Public License Version 1.0
+        testonly_ = True,
+        deps = ["@org_hamcrest_core"],
+    )
+
+    java_import_external(
+        name = "org_hamcrest_core",
+        jar_sha256 = "66fdef91e9739348df7a096aa384a5685f4e875584cce89386a7a47251c4d8e9",
+        jar_urls = [
+            "https://mirror.bazel.build/repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
+            "http://repo1.maven.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
+            "http://maven.ibiblio.org/maven2/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar",
+        ],
+        licenses = ["notice"],  # New BSD License
+        testonly_ = True,
+    )
+
+    java_import_external(
+        name = "com_google_testing_compile",
+        jar_sha256 = "edc180fdcd9f740240da1a7a45673f46f59c5578d8cd3fbc912161f74b5aebb8",
+        jar_urls = [
+            "http://mirror.bazel.build/repo1.maven.org/maven2/com/google/testing/compile/compile-testing/0.11/compile-testing-0.11.jar",
+            "http://repo1.maven.org/maven2/com/google/testing/compile/compile-testing/0.11/compile-testing-0.11.jar",
+        ],
+        licenses = ["notice"],  # New BSD License
+        testonly_ = True,
+        deps = ["@com_google_guava", "@com_google_truth"],
+    )
+
+    java_import_external(
+        name = "com_google_truth",
+        jar_sha256 = "032eddc69652b0a1f8d458f999b4a9534965c646b8b5de0eba48ee69407051df",
+        jar_urls = [
+            "http://mirror.bazel.build/repo1.maven.org/maven2/com/google/truth/truth/0.32/truth-0.32.jar",
+            "http://repo1.maven.org/maven2/com/google/truth/truth/0.32/truth-0.32.jar",
+        ],
+        licenses = ["notice"],  # Apache 2.0
+        testonly_ = True,
+        deps = ["@com_google_guava"],
+    )
+
+    java_import_external(
+        name = "org_checkerframework_qual",
+        jar_sha256 = "a17501717ef7c8dda4dba73ded50c0d7cde440fd721acfeacbf19786ceac1ed6",
+        jar_urls = [
+            "http://mirror.bazel.build/repo1.maven.org/maven2/org/checkerframework/checker-qual/2.4.0/checker-qual-2.4.0.jar",
+            "http://repo1.maven.org/maven2/org/checkerframework/checker-qual/2.4.0/checker-qual-2.4.0.jar",
+        ],
+        licenses = ["notice"],  # Apache 2.0
+    )
+
+    java_import_external(
+        name = "com_squareup_javapoet",
+        jar_sha256 = "5bb5abdfe4366c15c0da3332c57d484e238bd48260d6f9d6acf2b08fdde1efea",
+        jar_urls = [
+            "http://mirror.bazel.build/repo1.maven.org/maven2/com/squareup/javapoet/1.9.0/javapoet-1.9.0.jar",
+            "http://repo1.maven.org/maven2/com/squareup/javapoet/1.9.0/javapoet-1.9.0.jar",
+        ],
+        licenses = ["notice"],  # Apache 2.0
+    )
+
+    tf_http_archive(
+        name = "com_google_pprof",
+        build_file = clean_dep("//third_party:pprof.BUILD"),
+        sha256 = "e0928ca4aa10ea1e0551e2d7ce4d1d7ea2d84b2abbdef082b0da84268791d0c4",
+        strip_prefix = "pprof-c0fb62ec88c411cc91194465e54db2632845b650",
+        urls = [
+            "https://mirror.bazel.build/github.com/google/pprof/archive/c0fb62ec88c411cc91194465e54db2632845b650.tar.gz",
+            "https://github.com/google/pprof/archive/c0fb62ec88c411cc91194465e54db2632845b650.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "cub_archive",
+        build_file = clean_dep("//third_party:cub.BUILD"),
+        sha256 = "6bfa06ab52a650ae7ee6963143a0bbc667d6504822cbd9670369b598f18c58c3",
+        strip_prefix = "cub-1.8.0",
+        urls = [
+            "https://mirror.bazel.build/github.com/NVlabs/cub/archive/1.8.0.zip",
+            "https://github.com/NVlabs/cub/archive/1.8.0.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "cython",
+        build_file = clean_dep("//third_party:cython.BUILD"),
+        delete = ["BUILD.bazel"],
+        sha256 = "bccc9aa050ea02595b2440188813b936eaf345e85fb9692790cecfe095cf91aa",
+        strip_prefix = "cython-0.28.4",
+        system_build_file = clean_dep("//third_party/systemlibs:cython.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/cython/cython/archive/0.28.4.tar.gz",
+            "https://github.com/cython/cython/archive/0.28.4.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "bazel_toolchains",
+        sha256 = "3b604699685c5c65dd3f6f17425570a4b2f00ddba2f750db15acc72e55bb098b",
+        strip_prefix = "bazel-toolchains-37acf1841ab1475c98a152cb9e446460c8ae29e1",
+        urls = [
+            "https://mirror.bazel.build/github.com/bazelbuild/bazel-toolchains/archive/37acf1841ab1475c98a152cb9e446460c8ae29e1.tar.gz",
+            "https://github.com/bazelbuild/bazel-toolchains/archive/37acf1841ab1475c98a152cb9e446460c8ae29e1.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "arm_neon_2_x86_sse",
+        build_file = clean_dep("//third_party:arm_neon_2_x86_sse.BUILD"),
+        sha256 = "c8d90aa4357f8079d427e87a6f4c493da1fa4140aee926c05902d7ec1533d9a5",
+        strip_prefix = "ARM_NEON_2_x86_SSE-0f77d9d182265259b135dad949230ecbf1a2633d",
+        urls = [
+            "https://mirror.bazel.build/github.com/intel/ARM_NEON_2_x86_SSE/archive/0f77d9d182265259b135dad949230ecbf1a2633d.tar.gz",
+            "https://github.com/intel/ARM_NEON_2_x86_SSE/archive/0f77d9d182265259b135dad949230ecbf1a2633d.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "double_conversion",
+        build_file = clean_dep("//third_party:double_conversion.BUILD"),
+        sha256 = "2f7fbffac0d98d201ad0586f686034371a6d152ca67508ab611adc2386ad30de",
+        strip_prefix = "double-conversion-3992066a95b823efc8ccc1baf82a1cfc73f6e9b8",
+        system_build_file = clean_dep("//third_party/systemlibs:double_conversion.BUILD"),
+        urls = [
+            "https://mirror.bazel.build/github.com/google/double-conversion/archive/3992066a95b823efc8ccc1baf82a1cfc73f6e9b8.zip",
+            "https://github.com/google/double-conversion/archive/3992066a95b823efc8ccc1baf82a1cfc73f6e9b8.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_mobilenet",
+        build_file = clean_dep("//third_party:tflite_mobilenet.BUILD"),
+        sha256 = "23f814d1c076bdf03715dfb6cab3713aa4fbdf040fd5448c43196bd2e97a4c1b",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_v1_224_android_quant_2017_11_08.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_v1_224_android_quant_2017_11_08.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_mobilenet_ssd",
+        build_file = str(Label("//third_party:tflite_mobilenet.BUILD")),
+        sha256 = "767057f2837a46d97882734b03428e8dd640b93236052b312b2f0e45613c1cf0",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_ssd_tflite_v1.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_ssd_tflite_v1.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_mobilenet_ssd_quant",
+        build_file = str(Label("//third_party:tflite_mobilenet.BUILD")),
+        sha256 = "a809cd290b4d6a2e8a9d5dad076e0bd695b8091974e0eed1052b480b2f21b6dc",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_0.75_quant_2018_06_29.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_0.75_quant_2018_06_29.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_mobilenet_ssd_quant_protobuf",
+        build_file = str(Label("//third_party:tflite_mobilenet.BUILD")),
+        sha256 = "09280972c5777f1aa775ef67cb4ac5d5ed21970acd8535aeca62450ef14f0d79",
+        strip_prefix = "ssd_mobilenet_v1_quantized_300x300_coco14_sync_2018_07_18",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_quantized_300x300_coco14_sync_2018_07_18.tar.gz",
+            "http://storage.googleapis.com/download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_quantized_300x300_coco14_sync_2018_07_18.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_conv_actions_frozen",
+        build_file = str(Label("//third_party:tflite_mobilenet.BUILD")),
+        sha256 = "d947b38cba389b5e2d0bfc3ea6cc49c784e187b41a071387b3742d1acac7691e",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/tflite/conv_actions_tflite.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/models/tflite/conv_actions_tflite.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_smartreply",
+        build_file = clean_dep("//third_party:tflite_smartreply.BUILD"),
+        sha256 = "8980151b85a87a9c1a3bb1ed4748119e4a85abd3cb5744d83da4d4bd0fbeef7c",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/models/tflite/smartreply_1.0_2017_11_01.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/models/tflite/smartreply_1.0_2017_11_01.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tflite_ovic_testdata",
+        build_file = clean_dep("//third_party:tflite_ovic_testdata.BUILD"),
+        sha256 = "a9a705d8d519220178e2e65d383fdb21da37fdb31d1e909b0a1acdac46479e9c",
+        strip_prefix = "ovic",
+        urls = [
+            "https://mirror.bazel.build/storage.googleapis.com/download.tensorflow.org/data/ovic.zip",
+            "https://storage.googleapis.com/download.tensorflow.org/data/ovic.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "build_bazel_rules_android",
+        sha256 = "cd06d15dd8bb59926e4d65f9003bfc20f9da4b2519985c27e190cddc8b7a7806",
+        strip_prefix = "rules_android-0.1.1",
+        urls = [
+            "https://mirror.bazel.build/github.com/bazelbuild/rules_android/archive/v0.1.1.zip",
+            "https://github.com/bazelbuild/rules_android/archive/v0.1.1.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "tbb",
+        build_file = clean_dep("//third_party/ngraph:tbb.BUILD"),
+        sha256 = "724686f90bcda78f13b76f297d964008737ccd6399328143c1c0093e73ae6a13",
+        strip_prefix = "tbb-tbb_2018",
+        urls = [
+            "https://mirror.bazel.build/github.com/01org/tbb/archive/tbb_2018.zip",
+            "https://github.com/01org/tbb/archive/tbb_2018.zip",
+        ],
+    )
+
+    tf_http_archive(
+        name = "ngraph",
+        build_file = clean_dep("//third_party/ngraph:ngraph.BUILD"),
+        sha256 = "bf9dcc88e5c66021e3aac80491a231711211540d613bf9b6bd28db3f5bb86b62",
+        strip_prefix = "ngraph-0.8.1",
+        urls = [
+            "https://mirror.bazel.build/github.com/NervanaSystems/ngraph/archive/v0.8.1.tar.gz",
+            "https://github.com/NervanaSystems/ngraph/archive/v0.8.1.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "nlohmann_json_lib",
+        build_file = clean_dep("//third_party/ngraph:nlohmann_json.BUILD"),
+        sha256 = "9f3549824af3ca7e9707a2503959886362801fb4926b869789d6929098a79e47",
+        strip_prefix = "json-3.1.1",
+        urls = [
+            "https://mirror.bazel.build/github.com/nlohmann/json/archive/v3.1.1.tar.gz",
+            "https://github.com/nlohmann/json/archive/v3.1.1.tar.gz",
+        ],
+    )
+
+    tf_http_archive(
+        name = "ngraph_tf",
+        build_file = clean_dep("//third_party/ngraph:ngraph_tf.BUILD"),
+        sha256 = "402f84c748c113780a60f35f39aab118435285543aee4900d712b76fbf8a21ee",
+        strip_prefix = "ngraph-tf-0.6.1",
+        urls = [
+            "https://mirror.bazel.build/github.com/NervanaSystems/ngraph-tf/archive/v0.6.1.tar.gz",
+            "https://github.com/NervanaSystems/ngraph-tf/archive/v0.6.1.tar.gz",
+        ],
+    )
+
+    ##############################################################################
+    # BIND DEFINITIONS
+    #
+    # Please do not add bind() definitions unless we have no other choice.
+    # If that ends up being the case, please leave a comment explaining
+    # why we can't depend on the canonical build target.
+
+    # gRPC wants a cares dependency but its contents is not actually
+    # important since we have set GRPC_ARES=0 in tools/bazel.rc
+    native.bind(
+        name = "cares",
+        actual = "@grpc//third_party/nanopb:nanopb",
+    )
+
+    # Needed by Protobuf
+    native.bind(
+        name = "grpc_cpp_plugin",
+        actual = "@grpc//:grpc_cpp_plugin",
+    )
+    native.bind(
+        name = "grpc_python_plugin",
+        actual = "@grpc//:grpc_python_plugin",
+    )
+
+    native.bind(
+        name = "grpc_lib",
+        actual = "@grpc//:grpc++",
+    )
+
+    native.bind(
+        name = "grpc_lib_unsecure",
+        actual = "@grpc//:grpc++_unsecure",
+    )
+
+    # Needed by gRPC
+    native.bind(
+        name = "libssl",
+        actual = "@boringssl//:ssl",
+    )
+
+    # Needed by gRPC
+    native.bind(
+        name = "nanopb",
+        actual = "@grpc//third_party/nanopb:nanopb",
+    )
+
+    # Needed by gRPC
+    native.bind(
+        name = "protobuf",
+        actual = "@protobuf_archive//:protobuf",
+    )
+
+    # gRPC expects //external:protobuf_clib and //external:protobuf_compiler
+    # to point to Protobuf's compiler library.
+    native.bind(
+        name = "protobuf_clib",
+        actual = "@protobuf_archive//:protoc_lib",
+    )
+
+    # Needed by gRPC
+    native.bind(
+        name = "protobuf_headers",
+        actual = "@protobuf_archive//:protobuf_headers",
+    )
+
+    # Needed by Protobuf
+    native.bind(
+        name = "python_headers",
+        actual = clean_dep("//third_party/python_runtime:headers"),
+    )
+
+    # Needed by Protobuf
+    native.bind(
+        name = "six",
+        actual = "@six_archive//:six",
+    )
+
+    # Needed by gRPC
+    native.bind(
+        name = "zlib",
+        actual = "@zlib_archive//:zlib",
+    )

@@ -31,6 +31,9 @@ from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import test as test_lib
 
+# TODO(yangzihao): Currently matmul autotuning is disabled by default. Use
+# os.environ["TF_MATMUL_AUTOTUNE_ENABLE"] = "1" to enable it.
+
 
 def _AddTest(test, op_name, testcase_name, fn):
   test_name = "_".join(["test", op_name, testcase_name])
@@ -203,7 +206,7 @@ class MatMulInfixOperatorTest(test_lib.TestCase):
     b = ops.convert_to_tensor([[40.0, 50.0], [60.0, 70.0], [80.0, 90.0]])
     c = infix_matmul(a, b)
     d = math_ops.matmul(a, b)
-    with self.test_session():
+    with self.cached_session():
       self.assertAllEqual(c.eval(), d.eval())
 
 

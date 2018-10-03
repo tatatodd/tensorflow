@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Debug estimators.
+"""Debug estimators (deprecated).
+
+This module and all its submodules are deprecated. See
+[contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+for migration instructions.
 
 Debug estimators are bias-only estimators that can be used for debugging
 and as simple baselines.
@@ -118,6 +122,10 @@ def debug_model_fn(features, labels, mode, params, config=None):
 class DebugClassifier(estimator.Estimator):
   """A classifier for TensorFlow Debug models.
 
+  THIS CLASS IS DEPRECATED. See
+  [contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+  for general migration instructions.
+
   Example:
 
   ```python
@@ -157,7 +165,8 @@ class DebugClassifier(estimator.Estimator):
                n_classes=2,
                weight_column_name=None,
                config=None,
-               feature_engineering_fn=None):
+               feature_engineering_fn=None,
+               label_keys=None):
     """Initializes a DebugClassifier instance.
 
     Args:
@@ -175,6 +184,8 @@ class DebugClassifier(estimator.Estimator):
       feature_engineering_fn: Feature engineering function. Takes features and
                         labels which are the output of `input_fn` and returns
                         features and labels which will be fed into the model.
+      label_keys: Optional list of strings with size `[n_classes]` defining the
+        label vocabulary. Only supported for `n_classes` > 2.
     Returns:
       A `DebugClassifier` estimator.
 
@@ -182,10 +193,11 @@ class DebugClassifier(estimator.Estimator):
       ValueError: If `n_classes` < 2.
     """
     params = {"head":
-              head_lib._multi_class_head(  # pylint: disable=protected-access
+              head_lib.multi_class_head(
                   n_classes=n_classes,
                   weight_column_name=weight_column_name,
-                  enable_centered_bias=True)}
+                  enable_centered_bias=True,
+                  label_keys=label_keys)}
 
     super(DebugClassifier, self).__init__(
         model_fn=debug_model_fn,
@@ -232,6 +244,10 @@ class DebugClassifier(estimator.Estimator):
 
 class DebugRegressor(estimator.Estimator):
   """A regressor for TensorFlow Debug models.
+
+  THIS CLASS IS DEPRECATED. See
+  [contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+  for general migration instructions.
 
   Example:
 
@@ -292,7 +308,7 @@ class DebugRegressor(estimator.Estimator):
 
     params = {
         "head":
-            head_lib._regression_head(  # pylint: disable=protected-access
+            head_lib.regression_head(
                 weight_column_name=weight_column_name,
                 label_dimension=label_dimension,
                 enable_centered_bias=True)

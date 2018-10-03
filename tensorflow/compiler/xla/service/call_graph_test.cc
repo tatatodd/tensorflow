@@ -15,13 +15,13 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/call_graph.h"
 
-#include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/test.h"
 #include "tensorflow/compiler/xla/test_helpers.h"
-#include "tensorflow/compiler/xla/tests/hlo_test_base.h"
+#include "tensorflow/compiler/xla/tests/hlo_verified_test_base.h"
 #include "tensorflow/compiler/xla/util.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
@@ -31,15 +31,16 @@ namespace {
 
 using ::testing::UnorderedElementsAre;
 
-class CallGraphTest : public HloTestBase {
+class CallGraphTest : public HloVerifiedTestBase {
  protected:
   // Build and return a trivial computation taking and returning a scalar.
-  std::unique_ptr<HloComputation> MakeScalarComputation() {
+  std::unique_ptr<HloComputation> MakeScalarComputation(
+      HloOpcode opcode = HloOpcode::kNegate) {
     HloComputation::Builder builder(TestName() + ".ScalarComputation");
     HloInstruction* param0 = builder.AddInstruction(
         HloInstruction::CreateParameter(0, kScalarShape, "param0"));
     builder.AddInstruction(
-        HloInstruction::CreateUnary(kScalarShape, HloOpcode::kNegate, param0));
+        HloInstruction::CreateUnary(kScalarShape, opcode, param0));
     return builder.Build();
   }
 
@@ -81,7 +82,7 @@ class CallGraphTest : public HloTestBase {
     HloInstruction* param0 = builder.AddInstruction(
         HloInstruction::CreateParameter(0, kScalarShape, "param0"));
     HloInstruction* zero = builder.AddInstruction(
-        HloInstruction::CreateConstant(Literal::CreateR0<float>(0.0f)));
+        HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
     builder.AddInstruction(HloInstruction::CreateBinary(
         ShapeUtil::MakeShape(PRED, {}), HloOpcode::kGt, param0, zero));
     return builder.Build();
@@ -95,8 +96,10 @@ TEST_F(CallGraphTest, SingletonComputation) {
   auto module = CreateNewModule();
   HloComputation* computation =
       module->AddEntryComputation(MakeScalarComputation());
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(1, call_graph->nodes().size());
+  EXPECT_TRUE(call_graph->IsFlattened());
+
   const CallGraphNode& node = call_graph->GetNode(computation);
   EXPECT_EQ(computation, node.computation());
   EXPECT_TRUE(node.callsites().empty());
@@ -115,7 +118,7 @@ TEST_F(CallGraphTest, UnreachableComputation) {
   HloComputation* unreachable_computation =
       module->AddEmbeddedComputation(MakeScalarComputation());
 
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(2, call_graph->nodes().size());
 
   const CallGraphNode& entry_node = call_graph->GetNode(entry_computation);
@@ -137,7 +140,7 @@ TEST_F(CallGraphTest, ParallelComputation) {
   HloComputation* entry_computation = module->AddEntryComputation(
       MakeMappingComputation(map_computation, /*callsites=*/5));
 
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(2, call_graph->nodes().size());
 
   const CallGraphNode& entry_node = call_graph->GetNode(entry_computation);
@@ -166,8 +169,12 @@ TEST_F(CallGraphTest, SequentialComputations) {
   HloComputation* entry_computation = module->AddEntryComputation(
       MakeCallingComputation(called_computation, /*callsites=*/3));
 
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(2, call_graph->nodes().size());
+
+  // The called computation is only called from one other computation, but there
+  // are multiple callsites.
+  EXPECT_FALSE(call_graph->IsFlattened());
 
   const CallGraphNode& entry_node = call_graph->GetNode(entry_computation);
   EXPECT_EQ(entry_computation, entry_node.computation());
@@ -203,8 +210,10 @@ TEST_F(CallGraphTest, ContextBothComputations) {
   HloComputation* entry_computation =
       module->AddEntryComputation(builder.Build());
 
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(2, call_graph->nodes().size());
+
+  EXPECT_FALSE(call_graph->IsFlattened());
 
   const CallGraphNode& entry_node = call_graph->GetNode(entry_computation);
   EXPECT_EQ(entry_computation, entry_node.computation());
@@ -226,6 +235,54 @@ TEST_F(CallGraphTest, ContextBothComputations) {
 
   const CallGraphNode& sub_node = call_graph->GetNode(subcomputation);
   EXPECT_EQ(CallContext::kBoth, sub_node.context());
+}
+
+TEST_F(CallGraphTest, ComputationWithConditional) {
+  // Test a call graph of a module with a conditional.
+  auto module = CreateNewModule();
+  HloComputation* true_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation(HloOpcode::kCeil));
+  HloComputation* false_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation(HloOpcode::kFloor));
+
+  HloComputation::Builder builder(TestName());
+  HloInstruction* pred = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
+  HloInstruction* const1 = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(56.4f)));
+  HloInstruction* const2 = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(12.6f)));
+  HloInstruction* conditional =
+      builder.AddInstruction(HloInstruction::CreateConditional(
+          kScalarShape, pred, const1, true_computation, const2,
+          false_computation));
+  HloComputation* entry_computation =
+      module->AddEntryComputation(builder.Build());
+
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
+
+  EXPECT_EQ(3, call_graph->nodes().size());
+
+  const CallGraphNode& entry_node = call_graph->GetNode(entry_computation);
+  EXPECT_EQ(entry_computation, entry_node.computation());
+  EXPECT_EQ(1, entry_node.callsites().size());
+
+  const CallSite& conditional_callsite = entry_node.callsites()[0];
+  EXPECT_EQ(conditional, conditional_callsite.instruction());
+  EXPECT_THAT(conditional_callsite.called_computations(),
+              UnorderedElementsAre(true_computation, false_computation));
+  EXPECT_EQ(CallContext::kSequential, conditional_callsite.context());
+  EXPECT_EQ(entry_node.GetCallSite(conditional), &conditional_callsite);
+
+  const CallGraphNode& true_node = call_graph->GetNode(true_computation);
+  EXPECT_TRUE(true_node.callees().empty());
+  EXPECT_EQ(1, true_node.callers().size());
+  EXPECT_EQ(entry_computation, true_node.callers()[0]);
+
+  const CallGraphNode& false_node = call_graph->GetNode(false_computation);
+  EXPECT_TRUE(false_node.callees().empty());
+  EXPECT_EQ(1, false_node.callers().size());
+  EXPECT_EQ(entry_computation, false_node.callers()[0]);
 }
 
 TEST_F(CallGraphTest, ComplexGraph) {
@@ -271,8 +328,9 @@ TEST_F(CallGraphTest, ComplexGraph) {
     entry_computation = module->AddEntryComputation(builder.Build());
   }
 
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   EXPECT_EQ(5, call_graph->nodes().size());
+  EXPECT_FALSE(call_graph->IsFlattened());
 
   // Entry computation has one while instruction calling two computations
   // (cond_computation and a_computation).
@@ -347,12 +405,84 @@ TEST_F(CallGraphTest, ComplexGraph) {
   EXPECT_TRUE(call_graph->Dominates(cond_computation, cond_computation));
 }
 
+TEST_F(CallGraphTest, ComplexGraphNearestAncestors) {
+  // Test NearestAncestorsInSameComputation on a call graph of a module with
+  // several computation called in various contexts. The call graph looks like:
+  //
+  //      entry
+  //      /  |
+  //     a   |
+  //   / | \ |
+  //  b  |  cond
+  //   \ |
+  //    c
+  //
+  // Calls are made via kCall, kWhile, and kMap instructions.
+  auto module = CreateNewModule();
+  HloComputation* cond_computation =
+      module->AddEmbeddedComputation(MakeConditionComputation());
+  HloComputation* c_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation());
+  HloComputation* b_computation = module->AddEmbeddedComputation(
+      MakeMappingComputation(c_computation, /*callsites=*/1));
+  HloInstruction* b_map = b_computation->root_instruction();
+
+  HloComputation* a_computation;
+  HloInstruction* a_call;
+  HloInstruction* a_while;
+  {
+    HloComputation::Builder builder(TestName() + ".a");
+    HloInstruction* param0 = builder.AddInstruction(
+        HloInstruction::CreateParameter(0, kScalarShape, "param0"));
+    a_call = builder.AddInstruction(
+        HloInstruction::CreateCall(kScalarShape, {param0}, c_computation));
+    a_while = builder.AddInstruction(HloInstruction::CreateWhile(
+        kScalarShape, cond_computation, b_computation, a_call));
+    a_computation = module->AddEmbeddedComputation(builder.Build());
+  }
+
+  HloComputation* entry_computation;
+  HloInstruction* entry_while;
+  {
+    HloComputation::Builder builder(TestName() + ".entry");
+    HloInstruction* param0 = builder.AddInstruction(
+        HloInstruction::CreateParameter(0, kScalarShape, "param0"));
+    entry_while = builder.AddInstruction(HloInstruction::CreateWhile(
+        kScalarShape, cond_computation, a_computation, param0));
+    entry_computation = module->AddEntryComputation(builder.Build());
+  }
+
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
+  EXPECT_EQ(5, call_graph->nodes().size());
+
+  // Verify NearestAncestorsInSameComputation for various instructions in the
+  // module.
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(a_call, a_call),
+            std::make_pair(a_call, a_call));
+
+  // c_computation is called from more than one site, so
+  // NearestAncestorsInSameComputation bails and returns nullptrs.
+  std::pair<HloInstruction*, HloInstruction*> null_pair = {nullptr, nullptr};
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(
+                b_map, c_computation->root_instruction()),
+            null_pair);
+
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(b_map, entry_while),
+            std::make_pair(entry_while, entry_while));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(b_map, a_call),
+            std::make_pair(a_while, a_call));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(a_while, a_call),
+            std::make_pair(a_while, a_call));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(a_while, b_map),
+            std::make_pair(a_while, a_while));
+}
+
 TEST_F(CallGraphTest, VisitSingletonComputation) {
   // Test the call graph visitor with a call graph with a single node.
   auto module = CreateNewModule();
   HloComputation* computation =
       module->AddEntryComputation(MakeScalarComputation());
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
 
   std::vector<HloComputation*> visited;
   TF_ASSERT_OK(call_graph->VisitNodes([&visited](const CallGraphNode& node) {
@@ -369,7 +499,7 @@ TEST_F(CallGraphTest, VisitUnreachableComputation) {
       module->AddEntryComputation(MakeScalarComputation());
   HloComputation* unreachable_computation =
       module->AddEmbeddedComputation(MakeScalarComputation());
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
 
   // Test visitation of only reachable nodes.
   {
@@ -403,7 +533,7 @@ TEST_F(CallGraphTest, VisitWithError) {
   // Test that the call graph visitor properly propagates errors.
   auto module = CreateNewModule();
   module->AddEntryComputation(MakeScalarComputation());
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
 
   Status status = call_graph->VisitNodes(
       [](const CallGraphNode&) { return InternalError("Visitation failed"); });
@@ -416,7 +546,3 @@ TEST_F(CallGraphTest, VisitWithError) {
 
 }  // namespace
 }  // namespace xla
-
-int main(int argc, char** argv) {
-  return xla::ParseDebugOptionsFlagsAndRunTests(argc, argv);
-}

@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import time
 
 from tensorflow.python.client import session
@@ -34,18 +35,23 @@ from tensorflow.python.training import monitored_session
 from tensorflow.python.training import queue_runner_impl
 
 
+_MockOp = collections.namedtuple("MockOp", ["name"])
+
+
 class QueueRunnerTest(test.TestCase):
 
   def testBasic(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var = variables.Variable(zero64)
+      var = variables.VariableV1(zero64)
       count_up_to = var.count_up_to(3)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       variables.global_variables_initializer().run()
       qr = queue_runner_impl.QueueRunner(queue, [count_up_to])
       threads = qr.create_threads(sess)
+      self.assertEqual(sorted(t.name for t in threads),
+                       ["QueueRunnerThread-fifo_queue-CountUpTo:0"])
       for t in threads:
         t.start()
       for t in threads:
@@ -55,16 +61,19 @@ class QueueRunnerTest(test.TestCase):
       self.assertEqual(3, var.eval())
 
   def testTwoOps(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var0 = variables.Variable(zero64)
+      var0 = variables.VariableV1(zero64)
       count_up_to_3 = var0.count_up_to(3)
-      var1 = variables.Variable(zero64)
+      var1 = variables.VariableV1(zero64)
       count_up_to_30 = var1.count_up_to(30)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       qr = queue_runner_impl.QueueRunner(queue, [count_up_to_3, count_up_to_30])
       threads = qr.create_threads(sess)
+      self.assertEqual(sorted(t.name for t in threads),
+                       ["QueueRunnerThread-fifo_queue-CountUpTo:0",
+                        "QueueRunnerThread-fifo_queue-CountUpTo_1:0"])
       variables.global_variables_initializer().run()
       for t in threads:
         t.start()
@@ -75,9 +84,10 @@ class QueueRunnerTest(test.TestCase):
       self.assertEqual(30, var1.eval())
 
   def testExceptionsCaptured(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
-      qr = queue_runner_impl.QueueRunner(queue, ["i fail", "so fail"])
+      qr = queue_runner_impl.QueueRunner(queue, [_MockOp("i fail"),
+                                                 _MockOp("so fail")])
       threads = qr.create_threads(sess)
       variables.global_variables_initializer().run()
       for t in threads:
@@ -90,7 +100,7 @@ class QueueRunnerTest(test.TestCase):
       self.assertTrue("Operation not in the graph" in str(exceptions[1]))
 
   def testRealDequeueEnqueue(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       q0 = data_flow_ops.FIFOQueue(3, dtypes.float32)
       enqueue0 = q0.enqueue((10.0,))
       close0 = q0.close()
@@ -118,10 +128,10 @@ class QueueRunnerTest(test.TestCase):
         dequeue1.eval()
 
   def testRespectCoordShouldStop(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var = variables.Variable(zero64)
+      var = variables.VariableV1(zero64)
       count_up_to = var.count_up_to(3)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       variables.global_variables_initializer().run()
@@ -131,6 +141,9 @@ class QueueRunnerTest(test.TestCase):
       coord = coordinator.Coordinator()
       coord.request_stop()
       threads = qr.create_threads(sess, coord)
+      self.assertEqual(sorted(t.name for t in threads),
+                       ["QueueRunnerThread-fifo_queue-CountUpTo:0",
+                        "QueueRunnerThread-fifo_queue-close_on_stop"])
       for t in threads:
         t.start()
       coord.join()
@@ -139,9 +152,9 @@ class QueueRunnerTest(test.TestCase):
       self.assertEqual(0, var.eval())
 
   def testRequestStopOnException(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
-      qr = queue_runner_impl.QueueRunner(queue, ["not an op"])
+      qr = queue_runner_impl.QueueRunner(queue, [_MockOp("not an op")])
       coord = coordinator.Coordinator()
       threads = qr.create_threads(sess, coord)
       for t in threads:
@@ -151,7 +164,7 @@ class QueueRunnerTest(test.TestCase):
         coord.join()
 
   def testGracePeriod(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # The enqueue will quickly block.
       queue = data_flow_ops.FIFOQueue(2, dtypes.float32)
       enqueue = queue.enqueue((10.0,))
@@ -168,10 +181,10 @@ class QueueRunnerTest(test.TestCase):
       coord.join(stop_grace_period_secs=1.0)
 
   def testMultipleSessions(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       with session.Session() as other_sess:
         zero64 = constant_op.constant(0, dtype=dtypes.int64)
-        var = variables.Variable(zero64)
+        var = variables.VariableV1(zero64)
         count_up_to = var.count_up_to(3)
         queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
         variables.global_variables_initializer().run()
@@ -183,10 +196,10 @@ class QueueRunnerTest(test.TestCase):
         self.assertEqual(len(threads), len(other_threads))
 
   def testIgnoreMultiStarts(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var = variables.Variable(zero64)
+      var = variables.VariableV1(zero64)
       count_up_to = var.count_up_to(3)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       variables.global_variables_initializer().run()
@@ -199,15 +212,19 @@ class QueueRunnerTest(test.TestCase):
       self.assertEqual([], new_threads)
 
   def testThreads(self):
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var = variables.Variable(zero64)
+      var = variables.VariableV1(zero64)
       count_up_to = var.count_up_to(3)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       variables.global_variables_initializer().run()
-      qr = queue_runner_impl.QueueRunner(queue, [count_up_to, "bad op"])
+      qr = queue_runner_impl.QueueRunner(queue, [count_up_to,
+                                                 _MockOp("bad_op")])
       threads = qr.create_threads(sess, start=True)
+      self.assertEqual(sorted(t.name for t in threads),
+                       ["QueueRunnerThread-fifo_queue-CountUpTo:0",
+                        "QueueRunnerThread-fifo_queue-bad_op"])
       for t in threads:
         t.join()
       exceptions = qr.exceptions_raised
@@ -233,13 +250,13 @@ class QueueRunnerTest(test.TestCase):
   def testStartQueueRunners(self):
     # CountUpTo will raise OUT_OF_RANGE when it reaches the count.
     zero64 = constant_op.constant(0, dtype=dtypes.int64)
-    var = variables.Variable(zero64)
+    var = variables.VariableV1(zero64)
     count_up_to = var.count_up_to(3)
     queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
     init_op = variables.global_variables_initializer()
     qr = queue_runner_impl.QueueRunner(queue, [count_up_to])
     queue_runner_impl.add_queue_runner(qr)
-    with self.test_session() as sess:
+    with self.cached_session() as sess:
       init_op.run()
       threads = queue_runner_impl.start_queue_runners(sess)
       for t in threads:
@@ -250,26 +267,26 @@ class QueueRunnerTest(test.TestCase):
 
   def testStartQueueRunnersRaisesIfNotASession(self):
     zero64 = constant_op.constant(0, dtype=dtypes.int64)
-    var = variables.Variable(zero64)
+    var = variables.VariableV1(zero64)
     count_up_to = var.count_up_to(3)
     queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
     init_op = variables.global_variables_initializer()
     qr = queue_runner_impl.QueueRunner(queue, [count_up_to])
     queue_runner_impl.add_queue_runner(qr)
-    with self.test_session():
+    with self.cached_session():
       init_op.run()
       with self.assertRaisesRegexp(TypeError, "tf.Session"):
         queue_runner_impl.start_queue_runners("NotASession")
 
   def testStartQueueRunnersIgnoresMonitoredSession(self):
     zero64 = constant_op.constant(0, dtype=dtypes.int64)
-    var = variables.Variable(zero64)
+    var = variables.VariableV1(zero64)
     count_up_to = var.count_up_to(3)
     queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
     init_op = variables.global_variables_initializer()
     qr = queue_runner_impl.QueueRunner(queue, [count_up_to])
     queue_runner_impl.add_queue_runner(qr)
-    with self.test_session():
+    with self.cached_session():
       init_op.run()
       threads = queue_runner_impl.start_queue_runners(
           monitored_session.MonitoredSession())
@@ -280,13 +297,13 @@ class QueueRunnerTest(test.TestCase):
     graph = ops.Graph()
     with graph.as_default():
       zero64 = constant_op.constant(0, dtype=dtypes.int64)
-      var = variables.Variable(zero64)
+      var = variables.VariableV1(zero64)
       count_up_to = var.count_up_to(3)
       queue = data_flow_ops.FIFOQueue(10, dtypes.float32)
       init_op = variables.global_variables_initializer()
       qr = queue_runner_impl.QueueRunner(queue, [count_up_to])
       queue_runner_impl.add_queue_runner(qr)
-    with self.test_session(graph=graph) as sess:
+    with self.session(graph=graph) as sess:
       init_op.run()
       threads = queue_runner_impl.start_queue_runners(sess)
       for t in threads:

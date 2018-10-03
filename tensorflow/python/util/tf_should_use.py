@@ -17,50 +17,119 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-import functools
-import itertools
+import copy
+import sys
 import traceback
-import types
 
 import six  # pylint: disable=unused-import
 
-from backports import weakref  # pylint: disable=g-bad-import-order
-
 from tensorflow.python.platform import tf_logging
 from tensorflow.python.util import tf_decorator
+# pylint: enable=g-bad-import-order,g-import-not-at-top
 
 
-class _RefInfoField(
-    collections.namedtuple(
-        '_RefInfoField', ('type_', 'repr_', 'creation_stack', 'object_used'))):
-  pass
+class _TFShouldUseHelper(object):
+  """Object stored in TFShouldUse-wrapped objects.
 
+  When it is deleted it will emit a warning or error if its `sate` method
+  has not been called by time of deletion.
+  """
 
-# Thread-safe up to int32max/2 thanks to python's GIL; and may be safe even for
-# higher values in Python 3.4+.  We don't expect to ever count higher than this.
-# https://mail.python.org/pipermail/python-list/2005-April/342279.html
-_REF_ITER = itertools.count()
+  def __init__(self, type_, repr_, stack_frame, fatal_error_if_unsated):
+    self._type = type_
+    self._repr = repr_
+    self._stack_frame = stack_frame
+    self._fatal_error_if_unsated = fatal_error_if_unsated
+    self._sated = False
 
-# Dictionary mapping id(obj) => _RefInfoField.
-_REF_INFO = {}
+  def sate(self):
+    self._sated = True
+    self._type = None
+    self._repr = None
+    self._stack_frame = None
+    self._logging_module = None
 
-
-def _deleted(obj_id, fatal_error):
-  obj = _REF_INFO[obj_id]
-  del _REF_INFO[obj_id]
-  if not obj.object_used:
-    if fatal_error:
+  def __del__(self):
+    if self._sated:
+      return
+    if self._fatal_error_if_unsated:
       logger = tf_logging.fatal
     else:
       logger = tf_logging.error
+    creation_stack = ''.join(
+        [line.rstrip() for line in traceback.format_stack(self._stack_frame)])
     logger(
         '==================================\n'
         'Object was never used (type %s):\n%s\nIf you want to mark it as '
         'used call its "mark_used()" method.\nIt was originally created '
         'here:\n%s\n'
         '==================================' %
-        (obj.type_, obj.repr_, obj.creation_stack))
+        (self._type, self._repr, creation_stack))
+
+
+def _new__init__(self, true_value, tf_should_use_helper):
+  # pylint: disable=protected-access
+  self._tf_should_use_helper = tf_should_use_helper
+  self._true_value = true_value
+
+
+def _new__setattr__(self, key, value):
+  if key in ('_tf_should_use_helper', '_true_value'):
+    return object.__setattr__(self, key, value)
+  return setattr(
+      object.__getattribute__(self, '_true_value'),
+      key, value)
+
+
+def _new__getattribute__(self, key):
+  if key not in ('_tf_should_use_helper', '_true_value'):
+    object.__getattribute__(self, '_tf_should_use_helper').sate()
+  if key in ('_tf_should_use_helper', 'mark_used', '__setatt__'):
+    return object.__getattribute__(self, key)
+  return getattr(object.__getattribute__(self, '_true_value'), key)
+
+
+def _new_mark_used(self, *args, **kwargs):
+  object.__getattribute__(self, '_tf_should_use_helper').sate()
+  try:
+    mu = object.__getattribute__(
+        object.__getattribute__(self, '_true_value'),
+        'mark_used')
+    return mu(*args, **kwargs)
+  except AttributeError:
+    pass
+
+
+_WRAPPERS = dict()
+
+
+def _get_wrapper(x, tf_should_use_helper):
+  """Create a wrapper for object x, whose class subclasses type(x).
+
+  The wrapper will emit a warning if it is deleted without any of its
+  properties being accessed or methods being called.
+
+  Args:
+    x: The instance to wrap.
+    tf_should_use_helper: The object that tracks usage.
+
+  Returns:
+    An object wrapping `x`, of type `type(x)`.
+  """
+  type_x = type(x)
+  memoized = _WRAPPERS.get(type_x, None)
+  if memoized:
+    return memoized(x, tf_should_use_helper)
+
+  tx = copy.deepcopy(type_x)
+  copy_tx = type(tx.__name__, tx.__bases__, dict(tx.__dict__))
+  copy_tx.__init__ = _new__init__
+  copy_tx.__getattribute__ = _new__getattribute__
+  copy_tx.mark_used = _new_mark_used
+  copy_tx.__setattr__ = _new__setattr__
+  _WRAPPERS[type_x] = copy_tx
+
+  return copy_tx(x, tf_should_use_helper)
 
 
 def _add_should_use_warning(x, fatal_error=False):
@@ -75,72 +144,22 @@ def _add_should_use_warning(x, fatal_error=False):
     An instance of `TFShouldUseWarningWrapper` which subclasses `type(x)`
     and is a very shallow wrapper for `x` which logs access into `x`.
   """
-  if x is None:  # special corner case where x is None
-    return x
-  if hasattr(x, '_tf_ref_id'):  # this is already a TFShouldUseWarningWrapper
+  if x is None or x == []:  # pylint: disable=g-explicit-bool-comparison
     return x
 
-  def override_method(method):
-    def fn(self, *args, **kwargs):
-      # pylint: disable=protected-access
-      _REF_INFO[self._tf_ref_id] = _REF_INFO[self._tf_ref_id]._replace(
-          object_used=True)
-      return method(self, *args, **kwargs)
-    return fn
+  # Extract the current frame for later use by traceback printing.
+  try:
+    raise ValueError()
+  except ValueError:
+    stack_frame = sys.exc_info()[2].tb_frame.f_back
 
-  class TFShouldUseWarningWrapper(type(x)):
-    """Wrapper for objects that keeps track of their use."""
+  tf_should_use_helper = _TFShouldUseHelper(
+      type_=type(x),
+      repr_=repr(x),
+      stack_frame=stack_frame,
+      fatal_error_if_unsated=fatal_error)
 
-    def __init__(self, true_self):
-      self.__dict__ = true_self.__dict__
-      stack = [s.strip() for s in traceback.format_stack()]
-      # Remove top three stack entries from adding the wrapper
-      self.creation_stack = '\n'.join(stack[:-3])
-      self._tf_ref_id = next(_REF_ITER)
-      _REF_INFO[self._tf_ref_id] = _RefInfoField(
-          type_=type(x),
-          repr_=repr(x),
-          creation_stack=stack,
-          object_used=False)
-
-      # Create a finalizer for self, which will be called when self is
-      # garbage collected.  Can't add self as the args because the
-      # loop will break garbage collection.  We keep track of
-      # ourselves via python ids.
-      weakref.finalize(self, _deleted, self._tf_ref_id, fatal_error)
-
-    # Not sure why this pylint warning is being used; this is not an
-    # old class form.
-    # pylint: disable=super-on-old-class
-    def __getattribute__(self, name):
-      if name == '_tf_ref_id':
-        return super(TFShouldUseWarningWrapper, self).__getattribute__(name)
-      if self._tf_ref_id in _REF_INFO:
-        _REF_INFO[self._tf_ref_id] = _REF_INFO[self._tf_ref_id]._replace(
-            object_used=True)
-      return super(TFShouldUseWarningWrapper, self).__getattribute__(name)
-
-    def mark_used(self, *args, **kwargs):
-      _REF_INFO[self._tf_ref_id] = _REF_INFO[self._tf_ref_id]._replace(
-          object_used=True)
-      if hasattr(super(TFShouldUseWarningWrapper, self), 'mark_used'):
-        return super(TFShouldUseWarningWrapper, self).mark_used(*args, **kwargs)
-    # pylint: enable=super-on-old-class
-
-  for name in dir(TFShouldUseWarningWrapper):
-    method = getattr(TFShouldUseWarningWrapper, name)
-    if not isinstance(method, types.FunctionType):
-      continue
-    if name in ('__init__', '__getattribute__', '__del__', 'mark_used'):
-      continue
-    setattr(TFShouldUseWarningWrapper, name,
-            functools.wraps(method)(override_method(method)))
-
-  wrapped = TFShouldUseWarningWrapper(x)
-  wrapped.__doc__ = x.__doc__  # functools.wraps fails on some objects.
-  ref_id = wrapped._tf_ref_id  # pylint: disable=protected-access
-  _REF_INFO[ref_id] = _REF_INFO[ref_id]._replace(object_used=False)
-  return wrapped
+  return _get_wrapper(x, tf_should_use_helper)
 
 
 def should_use_result(fn):

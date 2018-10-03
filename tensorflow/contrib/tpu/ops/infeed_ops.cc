@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/shape_inference.h"
 
@@ -26,16 +27,7 @@ REGISTER_OP("InfeedDequeue")
     .Attr("dtype: type")
     .Attr("shape: shape")
     .SetIsStateful()
-    .SetShapeFn([](InferenceContext* c) {
-      PartialTensorShape shape;
-      TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape));
-      TensorShapeProto shape_proto;
-      shape.AsProto(&shape_proto);
-      ShapeHandle out;
-      TF_RETURN_IF_ERROR(c->MakeShapeFromShapeProto(shape_proto, &out));
-      c->set_output(0, out);
-      return Status::OK();
-    })
+    .SetShapeFn(shape_inference::ExplicitShape)
     .Doc(R"doc(
 A placeholder op for a value that will be fed into the computation.
 
@@ -49,6 +41,7 @@ REGISTER_OP("InfeedEnqueue")
     .Attr("dtype: type")
     .Attr("shape: shape = {}")
     .Attr("device_ordinal: int = -1")
+    .SetShapeFn(shape_inference::NoOutputs)
     .SetIsStateful()
     .Doc(R"doc(
 An op which feeds a single Tensor value into the computation.
@@ -66,6 +59,7 @@ REGISTER_OP("InfeedEnqueueTuple")
     .Attr("dtypes: list(type)")
     .Attr("shapes: list(shape)")
     .Attr("device_ordinal: int = -1")
+    .SetShapeFn(shape_inference::NoOutputs)
     .SetIsStateful()
     .Doc(R"doc(
 An op which feeds multiple Tensor values into the computation as an XLA tuple.
@@ -87,10 +81,8 @@ REGISTER_OP("InfeedDequeueTuple")
       std::vector<PartialTensorShape> shapes;
       TF_RETURN_IF_ERROR(c->GetAttr("shapes", &shapes));
       for (int i = 0; i < shapes.size(); ++i) {
-        TensorShapeProto shape_proto;
-        shapes[i].AsProto(&shape_proto);
         ShapeHandle out;
-        TF_RETURN_IF_ERROR(c->MakeShapeFromShapeProto(shape_proto, &out));
+        TF_RETURN_IF_ERROR(c->MakeShapeFromPartialTensorShape(shapes[i], &out));
         c->set_output(i, out);
       }
       return Status::OK();

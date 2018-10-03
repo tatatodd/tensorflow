@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/local_device.h"
@@ -44,16 +45,20 @@ extern const char* const DEVICE_GPU_XLA_JIT;  // "GPU_XLA_JIT"
 extern const char* const DEVICE_XLA_CPU;
 extern const char* const DEVICE_XLA_GPU;
 
-constexpr std::array<DataType, 2> kIntTypes = {{DT_INT32, DT_INT64}};
-constexpr std::array<DataType, 2> kFloatTypes = {{DT_FLOAT, DT_DOUBLE}};
-constexpr std::array<DataType, 4> kNumericTypes = {
-    {DT_INT32, DT_INT64, DT_FLOAT, DT_DOUBLE}};
+constexpr std::array<DataType, 4> kFloatTypes = {
+    {DT_HALF, DT_FLOAT, DT_DOUBLE, DT_BFLOAT16}};
+constexpr std::array<DataType, 11> kNumericTypes = {
+    {DT_UINT8, DT_UINT32, DT_UINT64, DT_INT8, DT_INT32, DT_INT64, DT_HALF,
+     DT_FLOAT, DT_DOUBLE, DT_COMPLEX64, DT_BFLOAT16}};
 
-constexpr std::array<DataType, 5> kCpuAllTypes = {
-    {DT_INT32, DT_INT64, DT_FLOAT, DT_DOUBLE, DT_BOOL}};
+constexpr std::array<DataType, 14> kCpuAllTypes = {
+    {DT_UINT8, DT_QUINT8, DT_UINT32, DT_UINT64, DT_INT8, DT_QINT8, DT_INT32,
+     DT_QINT32, DT_INT64, DT_HALF, DT_FLOAT, DT_DOUBLE, DT_COMPLEX64, DT_BOOL}};
 
-constexpr std::array<DataType, 5> kGpuAllTypes = {
-    {DT_INT32, DT_INT64, DT_FLOAT, DT_DOUBLE, DT_BOOL}};
+constexpr std::array<DataType, 15> kGpuAllTypes = {
+    {DT_UINT8, DT_QUINT8, DT_UINT32, DT_UINT64, DT_INT8, DT_QINT8, DT_INT32,
+     DT_QINT32, DT_INT64, DT_HALF, DT_FLOAT, DT_DOUBLE, DT_COMPLEX64, DT_BOOL,
+     DT_BFLOAT16}};
 
 // Class that manages registrations of operators and devices for the XLA JIT.
 // Not thread-safe.
@@ -90,8 +95,14 @@ class XlaOpRegistry {
   // the device; it may optionally modify the KernelDef.
   typedef bool (*BackendOpFilter)(KernelDef* kdef);
   static void RegisterBackend(const string& compilation_device_name,
-                              gtl::ArraySlice<DataType> supported_types,
+                              absl::Span<const DataType> supported_types,
                               BackendOpFilter op_filter);
+
+  // Returns the names of the registered backends.
+  static std::vector<string> BackendNames();
+
+  // Returns true iff a backend with the given name is registered.
+  static bool IsBackendRegistered(const string& name);
 
   // Registers `device_name` for XLA compilation, using information from
   // `registration`.
@@ -112,10 +123,23 @@ class XlaOpRegistry {
   static void RegisterCompilationKernels();
 
   // Returns KernelDefs for compilation ops registered on
-  // 'compilation_device_name'.
-  // Does not include kernels registered as CompilationOnly.
+  // 'compilation_device_name'.  Does not include kernels registered as
+  // CompilationOnly, iff include_compilation_only_kernels=false.
   static std::vector<const KernelDef*> DeviceKernels(
-      const string& compilation_device_name);
+      const string& compilation_device_name,
+      bool include_compilation_only_kernels);
+
+  // Returns all operations for which there are XLA kernels on any device.
+  static std::vector<string> GetAllRegisteredOps();
+
+  // Returns the set of compile-time constant inputs to 'op'. Returns nullptr
+  // if the op is not registered.
+  static const std::unordered_set<string>* CompileTimeConstantInputs(
+      const string& op);
+
+  // Returns true if `op` is a "metadata" op, one that only looks at the shapes
+  // of its operands and not their values.
+  static bool IsMetadataOp(const string& op);
 
  private:
   friend class XlaBackendRegistrar;
@@ -170,12 +194,28 @@ class XlaOpRegistry {
     bool has_device_whitelist = false;
     std::unordered_set<string> device_whitelist;
 
+    // Names of arguments that must be compile-time constants.
+    std::unordered_set<string> compile_time_constant_inputs;
+
+    // True if this is a "metadata" op, one that only looks at the shapes of its
+    // operands and not their values.
+    bool is_metadata_op = false;
+
     // Factory used to build OpKernels that perform symbolic execution.
     Factory factory;
   };
 
+  // Returns true if registrations x and y can both be added to the registry.
+  // This is always the case if they refer to different ops. If they refer to
+  // the same op name, they must: have the same values for compilation_only and
+  // allow_resource_types; use a device_whitelist; and their
+  // whitelists must not intersect.
+  static bool IsCompatible(const OpRegistration& x, const OpRegistration& y);
+
   // Map from operator name to OpRegistrations, populated by REGISTER_XLA_OP.
-  std::unordered_map<string, std::unique_ptr<OpRegistration>> ops_
+  // Registrations present under the same key must satisfy IsCompatible above,
+  // and this is checked during registration.
+  std::unordered_map<string, std::vector<std::unique_ptr<OpRegistration>>> ops_
       GUARDED_BY(mutex_);
 
   // Have we already registered the JIT kernels on the JIT devices?
@@ -201,19 +241,19 @@ class XlaOpRegistry {
 class XlaOpRegistrationBuilder {
  public:
   // Starts an operator registration chain.
-  static XlaOpRegistrationBuilder Name(StringPiece name);
+  static XlaOpRegistrationBuilder Name(absl::string_view name);
 
   // Specifies a whitelist of devices on which the operator may run.
-  XlaOpRegistrationBuilder& Device(StringPiece devices);
-  XlaOpRegistrationBuilder& Device(gtl::ArraySlice<StringPiece> devices);
+  XlaOpRegistrationBuilder& Device(absl::string_view devices);
+  XlaOpRegistrationBuilder& Device(absl::Span<const absl::string_view> devices);
 
   // Specifies a type constraint for a type variable attribute. Each constraint
   // specifies the set of types that the type variable may assume.
-  XlaOpRegistrationBuilder& TypeConstraint(StringPiece attr_name,
+  XlaOpRegistrationBuilder& TypeConstraint(absl::string_view attr_name,
                                            DataType allowed);
 
-  XlaOpRegistrationBuilder& TypeConstraint(StringPiece attr_name,
-                                           gtl::ArraySlice<DataType> allowed);
+  XlaOpRegistrationBuilder& TypeConstraint(absl::string_view attr_name,
+                                           absl::Span<const DataType> allowed);
 
   // Specifies that a dummy copy of this operator should not be registered on
   // XLA_* devices, but may be used during compilation.
@@ -222,11 +262,18 @@ class XlaOpRegistrationBuilder {
   // Allow DT_RESOURCE types for type parameters.
   XlaOpRegistrationBuilder& AllowResourceTypes();
 
+  // Mark 'input_name' as an argument whose value must be known at compile-time.
+  XlaOpRegistrationBuilder& CompileTimeConstInput(absl::string_view input_name);
+
+  // Mark this op as a "metadata" op, one that only looks at the shapes of its
+  // operands and not their values.
+  XlaOpRegistrationBuilder& IsMetadataOp();
+
   std::unique_ptr<XlaOpRegistry::OpRegistration> Build(
       XlaOpRegistry::Factory factory);
 
  private:
-  XlaOpRegistrationBuilder(StringPiece name);
+  XlaOpRegistrationBuilder(absl::string_view name);
 
   std::unique_ptr<XlaOpRegistry::OpRegistration> registration_;
 };
@@ -248,13 +295,13 @@ class XlaOpRegistrar {
 
 #define REGISTER_XLA_OP_UNIQ(CTR, BUILDER, OP)                                 \
   static ::tensorflow::XlaOpRegistrar xla_op_registrar__body__##CTR##__object( \
-      XlaOpRegistrationBuilder::BUILDER.Build(                                 \
+      ::tensorflow::XlaOpRegistrationBuilder::BUILDER.Build(                   \
           [](::tensorflow::OpKernelConstruction* context)                      \
               -> ::tensorflow::OpKernel* { return new OP(context); }));
 
 class XlaBackendRegistrar {
  public:
-  XlaBackendRegistrar(StringPiece name, gtl::ArraySlice<DataType> types,
+  XlaBackendRegistrar(absl::string_view name, absl::Span<const DataType> types,
                       XlaOpRegistry::BackendOpFilter op_filter = nullptr);
 };
 

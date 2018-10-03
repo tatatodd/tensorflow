@@ -25,11 +25,19 @@ import six
 from tensorflow.python.estimator import estimator
 from tensorflow.python.estimator.canned import head as head_lib
 from tensorflow.python.estimator.canned import optimizers
-from tensorflow.python.feature_column import feature_column as feature_column_lib
+from tensorflow.python.feature_column import feature_column
+from tensorflow.python.feature_column import feature_column_v2
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import nn
 from tensorflow.python.ops import partitioned_variables
+from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import variable_scope
+from tensorflow.python.ops import variables as variable_ops
+from tensorflow.python.ops.losses import losses
+from tensorflow.python.summary import summary
 from tensorflow.python.training import ftrl
-from tensorflow.python.training import training_util
+from tensorflow.python.util import nest
+from tensorflow.python.util.tf_export import estimator_export
 
 
 # The default learning rate of 0.2 is a historical artifact of the initial
@@ -42,38 +50,149 @@ def _get_default_optimizer(feature_columns):
   return ftrl.FtrlOptimizer(learning_rate=learning_rate)
 
 
-# TODO(b/36813849): Revisit passing params vs named arguments.
-def _linear_model_fn(features, labels, mode, params, config):
+def _get_expanded_variable_list(var_list):
+  """Given a list of variables, expands them if they are partitioned.
+
+  Args:
+    var_list: A list of variables.
+
+  Returns:
+    A list of variables where each partitioned variable is expanded to its
+    components.
+  """
+  returned_list = []
+  for variable in var_list:
+    if (isinstance(variable, variable_ops.Variable) or
+        resource_variable_ops.is_resource_variable(variable)):
+      returned_list.append(variable)  # Single variable case.
+    else:  # Must be a PartitionedVariable, so convert into a list.
+      returned_list.extend(list(variable))
+  return returned_list
+
+
+# TODO(rohanj): Consider making this a public utility method.
+def _compute_fraction_of_zero(variables):
+  """Given a linear variables list, compute the fraction of zero weights.
+
+  Args:
+    variables: A list or list of list of variables
+
+  Returns:
+    The fraction of zeros (sparsity) in the linear model.
+  """
+  all_weight_vars = []
+  for var_or_var_list in variables:
+    var_list = nest.flatten(var_or_var_list)
+    # Skip empty-lists associated with columns that created no Variables.
+    if var_list:
+      all_weight_vars += [array_ops.reshape(var, [-1]) for var in var_list]
+  return nn.zero_fraction(array_ops.concat(all_weight_vars, axis=0))
+
+
+def _linear_logit_fn_builder(units, feature_columns, sparse_combiner='sum'):
+  """Function builder for a linear logit_fn.
+
+  Args:
+    units: An int indicating the dimension of the logit layer.
+    feature_columns: An iterable containing all the feature columns used by
+      the model.
+    sparse_combiner: A string specifying how to reduce if a categorical column
+      is multivalent.  One of "mean", "sqrtn", and "sum".
+
+  Returns:
+    A logit_fn (see below).
+
+  """
+
+  def linear_logit_fn(features):
+    """Linear model logit_fn.
+
+    Args:
+      features: This is the first item returned from the `input_fn`
+                passed to `train`, `evaluate`, and `predict`. This should be a
+                single `Tensor` or `dict` of same.
+
+    Returns:
+      A `Tensor` representing the logits.
+    """
+    if feature_column_v2.is_feature_column_v2(feature_columns):
+      shared_state_manager = feature_column_v2.SharedEmbeddingStateManager()
+      linear_model = feature_column_v2.LinearModel(
+          feature_columns=feature_columns,
+          units=units,
+          sparse_combiner=sparse_combiner,
+          shared_state_manager=shared_state_manager)
+      logits = linear_model(features)
+      bias = linear_model.bias_variable
+
+      # We'd like to get all the non-bias variables associated with this
+      # LinearModel. This includes the shared embedding variables as well.
+      variables = linear_model.variables
+      variables.remove(bias)
+      variables.extend(shared_state_manager.variables)
+
+      # Expand (potential) Partitioned variables
+      bias = _get_expanded_variable_list([bias])
+      variables = _get_expanded_variable_list(variables)
+    else:
+      linear_model = feature_column._LinearModel(  # pylint: disable=protected-access
+          feature_columns=feature_columns,
+          units=units,
+          sparse_combiner=sparse_combiner,
+          name='linear_model')
+      logits = linear_model(features)
+      cols_to_vars = linear_model.cols_to_vars()
+      bias = cols_to_vars.pop('bias')
+      variables = cols_to_vars.values()
+
+    if units > 1:
+      summary.histogram('bias', bias)
+    else:
+      # If units == 1, the bias value is a length-1 list of a scalar Tensor,
+      # so we should provide a scalar summary.
+      summary.scalar('bias', bias[0][0])
+    summary.scalar('fraction_of_zero_weights',
+                   _compute_fraction_of_zero(variables))
+    return logits
+
+  return linear_logit_fn
+
+
+def _linear_model_fn(features, labels, mode, head, feature_columns, optimizer,
+                     partitioner, config, sparse_combiner='sum'):
   """A model_fn for linear models that use a gradient-based optimizer.
 
   Args:
-    features: Dict of `Tensor`.
+    features: dict of `Tensor`.
     labels: `Tensor` of shape `[batch_size, logits_dimension]`.
     mode: Defines whether this is training, evaluation or prediction.
       See `ModeKeys`.
-    params: A dict of hyperparameters.
-      The following hyperparameters are expected:
-      * head: A `Head` instance.
-      * feature_columns: An iterable containing all the feature columns used by
-          the model.
-      * optimizer: string, `Optimizer` object, or callable that defines the
-          optimizer to use for training. If `None`, will use a FTRL optimizer.
+    head: A `Head` instance.
+    feature_columns: An iterable containing all the feature columns used by
+      the model.
+    optimizer: string, `Optimizer` object, or callable that defines the
+      optimizer to use for training. If `None`, will use a FTRL optimizer.
+    partitioner: Partitioner for variables.
     config: `RunConfig` object to configure the runtime settings.
+    sparse_combiner: A string specifying how to reduce if a categorical column
+      is multivalent.  One of "mean", "sqrtn", and "sum".
 
   Returns:
     An `EstimatorSpec` instance.
 
   Raises:
-    ValueError: If mode or params are invalid.
+    ValueError: mode or params are invalid, or features has the wrong type.
   """
-  head = params['head']
-  feature_columns = tuple(params['feature_columns'])
+  if not isinstance(features, dict):
+    raise ValueError('features should be a dictionary of `Tensor`s. '
+                     'Given type: {}'.format(type(features)))
+
   optimizer = optimizers.get_optimizer_instance(
-      params.get('optimizer') or _get_default_optimizer(feature_columns),
+      optimizer or _get_default_optimizer(feature_columns),
       learning_rate=_LEARNING_RATE)
   num_ps_replicas = config.num_ps_replicas if config else 0
 
-  partitioner = params.get('partitioner') or (
+  partitioner = partitioner or (
       partitioned_variables.min_max_variable_partitioner(
           max_partitions=num_ps_replicas,
           min_slice_size=64 << 20))
@@ -83,25 +202,20 @@ def _linear_model_fn(features, labels, mode, params, config):
       values=tuple(six.itervalues(features)),
       partitioner=partitioner):
 
-    logits = feature_column_lib.linear_model(
-        features=features,
-        feature_columns=feature_columns,
-        units=head.logits_dimension)
-
-    def _train_op_fn(loss):
-      """Returns the op to optimize the loss."""
-      return optimizer.minimize(
-          loss,
-          global_step=training_util.get_global_step())
+    logit_fn = _linear_logit_fn_builder(
+        units=head.logits_dimension, feature_columns=feature_columns,
+        sparse_combiner=sparse_combiner)
+    logits = logit_fn(features=features)
 
     return head.create_estimator_spec(
         features=features,
         mode=mode,
         labels=labels,
-        train_op_fn=_train_op_fn,
+        optimizer=optimizer,
         logits=logits)
 
 
+@estimator_export('estimator.LinearClassifier')
 class LinearClassifier(estimator.Estimator):
   """Linear classifier model.
 
@@ -111,22 +225,42 @@ class LinearClassifier(estimator.Estimator):
   Example:
 
   ```python
-  sparse_column_a = sparse_column_with_hash_bucket(...)
-  sparse_column_b = sparse_column_with_hash_bucket(...)
+  categorical_column_a = categorical_column_with_hash_bucket(...)
+  categorical_column_b = categorical_column_with_hash_bucket(...)
 
-  sparse_feature_a_x_sparse_feature_b = crossed_column(...)
+  categorical_feature_a_x_categorical_feature_b = crossed_column(...)
 
   # Estimator using the default optimizer.
   estimator = LinearClassifier(
-      feature_columns=[sparse_column_a, sparse_feature_a_x_sparse_feature_b])
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b])
 
   # Or estimator using the FTRL optimizer with regularization.
   estimator = LinearClassifier(
-      feature_columns=[sparse_column_a, sparse_feature_a_x_sparse_feature_b],
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
       optimizer=tf.train.FtrlOptimizer(
         learning_rate=0.1,
         l1_regularization_strength=0.001
       ))
+
+  # Or estimator using an optimizer with a learning rate decay.
+  estimator = LinearClassifier(
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
+      optimizer=lambda: tf.train.FtrlOptimizer(
+          learning_rate=tf.exponential_decay(
+              learning_rate=0.1,
+              global_step=tf.get_global_step(),
+              decay_steps=10000,
+              decay_rate=0.96))
+
+  # Or estimator with warm-starting from a previous checkpoint.
+  estimator = LinearClassifier(
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
+      warm_start_from="/path/to/checkpoint/dir")
+
 
   # Input builders
   def input_fn_train: # returns x, y (where y represents label's class index).
@@ -153,6 +287,13 @@ class LinearClassifier(estimator.Estimator):
       whose `value` is a `Tensor`.
 
   Loss is calculated by using softmax cross entropy.
+
+  @compatibility(eager)
+  Estimators can be used while eager execution is enabled. Note that `input_fn`
+  and all hooks are executed inside a graph context, so they have to be written
+  to be compatible with graph mode. Note that `input_fn` code using `tf.data`
+  generally works in both graph and eager modes.
+  @end_compatibility
   """
 
   def __init__(self,
@@ -163,7 +304,10 @@ class LinearClassifier(estimator.Estimator):
                label_vocabulary=None,
                optimizer='Ftrl',
                config=None,
-               partitioner=None):
+               partitioner=None,
+               warm_start_from=None,
+               loss_reduction=losses.Reduction.SUM,
+               sparse_combiner='sum'):
     """Construct a `LinearClassifier` estimator object.
 
     Args:
@@ -191,10 +335,23 @@ class LinearClassifier(estimator.Estimator):
         encoded as integer values in {0, 1,..., n_classes-1} for `n_classes`>2 .
         Also there will be errors if vocabulary is not provided and labels are
         string.
-      optimizer: An instance of `tf.Optimizer` used to train the model. Defaults
-        to FTRL optimizer.
+      optimizer: An instance of `tf.Optimizer` used to train the model. Can also
+        be a string (one of 'Adagrad', 'Adam', 'Ftrl', 'RMSProp', 'SGD'), or
+        callable. Defaults to FTRL optimizer.
       config: `RunConfig` object to configure the runtime settings.
       partitioner: Optional. Partitioner for input layer.
+      warm_start_from: A string filepath to a checkpoint to warm-start from, or
+        a `WarmStartSettings` object to fully configure warm-starting.  If the
+        string filepath is provided instead of a `WarmStartSettings`, then all
+        weights and biases are warm-started, and it is assumed that vocabularies
+        and Tensor names are unchanged.
+      loss_reduction: One of `tf.losses.Reduction` except `NONE`. Describes how
+        to reduce training loss over batch. Defaults to `SUM`.
+      sparse_combiner: A string specifying how to reduce if a categorical column
+        is multivalent.  One of "mean", "sqrtn", and "sum" -- these are
+        effectively different ways to do example-level normalization, which can
+        be useful for bag-of-words features. for more details, see
+        `tf.feature_column.linear_model`.
 
     Returns:
       A `LinearClassifier` estimator.
@@ -205,23 +362,35 @@ class LinearClassifier(estimator.Estimator):
     if n_classes == 2:
       head = head_lib._binary_logistic_head_with_sigmoid_cross_entropy_loss(  # pylint: disable=protected-access
           weight_column=weight_column,
-          label_vocabulary=label_vocabulary)
+          label_vocabulary=label_vocabulary,
+          loss_reduction=loss_reduction)
     else:
       head = head_lib._multi_class_head_with_softmax_cross_entropy_loss(  # pylint: disable=protected-access
           n_classes, weight_column=weight_column,
-          label_vocabulary=label_vocabulary)
+          label_vocabulary=label_vocabulary,
+          loss_reduction=loss_reduction)
+
+    def _model_fn(features, labels, mode, config):
+      """Call the defined shared _linear_model_fn."""
+      return _linear_model_fn(
+          features=features,
+          labels=labels,
+          mode=mode,
+          head=head,
+          feature_columns=tuple(feature_columns or []),
+          optimizer=optimizer,
+          partitioner=partitioner,
+          config=config,
+          sparse_combiner=sparse_combiner)
+
     super(LinearClassifier, self).__init__(
-        model_fn=_linear_model_fn,
+        model_fn=_model_fn,
         model_dir=model_dir,
         config=config,
-        params={
-            'head': head,
-            'feature_columns': feature_columns,
-            'optimizer': optimizer,
-            'partitioner': partitioner,
-        })
+        warm_start_from=warm_start_from)
 
 
+@estimator_export('estimator.LinearRegressor')
 class LinearRegressor(estimator.Estimator):
   """An estimator for TensorFlow Linear regression problems.
 
@@ -231,13 +400,42 @@ class LinearRegressor(estimator.Estimator):
   Example:
 
   ```python
-  sparse_column_a = sparse_column_with_hash_bucket(...)
-  sparse_column_b = sparse_column_with_hash_bucket(...)
+  categorical_column_a = categorical_column_with_hash_bucket(...)
+  categorical_column_b = categorical_column_with_hash_bucket(...)
 
-  sparse_feature_a_x_sparse_feature_b = crossed_column(...)
+  categorical_feature_a_x_categorical_feature_b = crossed_column(...)
 
+  # Estimator using the default optimizer.
   estimator = LinearRegressor(
-      feature_columns=[sparse_column_a, sparse_feature_a_x_sparse_feature_b])
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b])
+
+  # Or estimator using the FTRL optimizer with regularization.
+  estimator = LinearRegressor(
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
+      optimizer=tf.train.FtrlOptimizer(
+        learning_rate=0.1,
+        l1_regularization_strength=0.001
+      ))
+
+  # Or estimator using an optimizer with a learning rate decay.
+  estimator = LinearRegressor(
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
+      optimizer=lambda: tf.train.FtrlOptimizer(
+          learning_rate=tf.exponential_decay(
+              learning_rate=0.1,
+              global_step=tf.get_global_step(),
+              decay_steps=10000,
+              decay_rate=0.96))
+
+  # Or estimator with warm-starting from a previous checkpoint.
+  estimator = LinearRegressor(
+      feature_columns=[categorical_column_a,
+                       categorical_feature_a_x_categorical_feature_b],
+      warm_start_from="/path/to/checkpoint/dir")
+
 
   # Input builders
   def input_fn_train: # returns x, y
@@ -264,6 +462,13 @@ class LinearRegressor(estimator.Estimator):
         key=column.name, value=a `Tensor`
 
   Loss is calculated by using mean squared error.
+
+  @compatibility(eager)
+  Estimators can be used while eager execution is enabled. Note that `input_fn`
+  and all hooks are executed inside a graph context, so they have to be written
+  to be compatible with graph mode. Note that `input_fn` code using `tf.data`
+  generally works in both graph and eager modes.
+  @end_compatibility
   """
 
   def __init__(self,
@@ -273,7 +478,10 @@ class LinearRegressor(estimator.Estimator):
                weight_column=None,
                optimizer='Ftrl',
                config=None,
-               partitioner=None):
+               partitioner=None,
+               warm_start_from=None,
+               loss_reduction=losses.Reduction.SUM,
+               sparse_combiner='sum'):
     """Initializes a `LinearRegressor` instance.
 
     Args:
@@ -293,26 +501,43 @@ class LinearRegressor(estimator.Estimator):
         used as a key to fetch weight tensor from the `features`. If it is a
         `_NumericColumn`, raw tensor is fetched by key `weight_column.key`,
         then weight_column.normalizer_fn is applied on it to get weight tensor.
-      optimizer: An instance of `tf.Optimizer` used to train the model. Defaults
-        to FTRL optimizer.
+      optimizer: An instance of `tf.Optimizer` used to train the model. Can also
+        be a string (one of 'Adagrad', 'Adam', 'Ftrl', 'RMSProp', 'SGD'), or
+        callable. Defaults to FTRL optimizer.
       config: `RunConfig` object to configure the runtime settings.
       partitioner: Optional. Partitioner for input layer.
+      warm_start_from: A string filepath to a checkpoint to warm-start from, or
+        a `WarmStartSettings` object to fully configure warm-starting.  If the
+        string filepath is provided instead of a `WarmStartSettings`, then all
+        weights and biases are warm-started, and it is assumed that vocabularies
+        and Tensor names are unchanged.
+      loss_reduction: One of `tf.losses.Reduction` except `NONE`. Describes how
+        to reduce training loss over batch. Defaults to `SUM`.
+      sparse_combiner: A string specifying how to reduce if a categorical column
+        is multivalent.  One of "mean", "sqrtn", and "sum" -- these are
+        effectively different ways to do example-level normalization, which can
+        be useful for bag-of-words features. for more details, see
+        `tf.feature_column.linear_model`.
     """
+    head = head_lib._regression_head(  # pylint: disable=protected-access
+        label_dimension=label_dimension, weight_column=weight_column,
+        loss_reduction=loss_reduction)
+
+    def _model_fn(features, labels, mode, config):
+      """Call the defined shared _linear_model_fn."""
+      return _linear_model_fn(
+          features=features,
+          labels=labels,
+          mode=mode,
+          head=head,
+          feature_columns=tuple(feature_columns or []),
+          optimizer=optimizer,
+          partitioner=partitioner,
+          config=config,
+          sparse_combiner=sparse_combiner)
+
     super(LinearRegressor, self).__init__(
-        model_fn=_linear_model_fn,
+        model_fn=_model_fn,
         model_dir=model_dir,
         config=config,
-        params={
-            # pylint: disable=protected-access
-            'head':
-                head_lib._regression_head_with_mean_squared_error_loss(
-                    label_dimension=label_dimension,
-                    weight_column=weight_column),
-            # pylint: enable=protected-access
-            'feature_columns':
-                feature_columns,
-            'optimizer':
-                optimizer,
-            'partitioner':
-                partitioner,
-        })
+        warm_start_from=warm_start_from)

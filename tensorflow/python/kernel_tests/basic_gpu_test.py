@@ -33,7 +33,7 @@ from tensorflow.python.ops import gradient_checker
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import variables
-from tensorflow.python.ops.gen_array_ops import _broadcast_gradient_args
+from tensorflow.python.ops.gen_array_ops import broadcast_gradient_args
 from tensorflow.python.platform import test
 
 
@@ -107,9 +107,12 @@ class MathBuiltinUnaryTest(test.TestCase):
 
   def _testDtype(self, dtype, use_gpu):
     data = (np.arange(-3, 3) / 4.).reshape([1, 3, 2]).astype(dtype)
+    data_gt_1 = data + 2 # for x > 1
     self._compare(data, np.abs, math_ops.abs, use_gpu)
     self._compare(data, np.arccos, math_ops.acos, use_gpu)
     self._compare(data, np.arcsin, math_ops.asin, use_gpu)
+    self._compare(data, np.arcsinh, math_ops.asinh, use_gpu)
+    self._compare(data_gt_1, np.arccosh, math_ops.acosh, use_gpu)
     self._compare(data, np.arctan, math_ops.atan, use_gpu)
     self._compare(data, np.ceil, math_ops.ceil, use_gpu)
     self._compare(data, np.cos, math_ops.cos, use_gpu)
@@ -126,6 +129,7 @@ class MathBuiltinUnaryTest(test.TestCase):
     self._compare(data, np.square, math_ops.square, use_gpu)
     self._compare(data, np.tan, math_ops.tan, use_gpu)
     self._compare(data, np.tanh, math_ops.tanh, use_gpu)
+    self._compare(data, np.arctanh, math_ops.atanh, use_gpu)
 
   def testTypes(self):
     for dtype in [np.float32]:
@@ -153,7 +157,7 @@ class BroadcastSimpleTest(test.TestCase):
 
   def _GetGradientArgs(self, xs, ys):
     with self.test_session(use_gpu=True) as sess:
-      return sess.run(_broadcast_gradient_args(xs, ys))
+      return sess.run(broadcast_gradient_args(xs, ys))
 
   def testBroadcast(self):
     r0, r1 = self._GetGradientArgs([2, 3, 5], [1])
@@ -170,7 +174,7 @@ class BroadcastSimpleTest(test.TestCase):
                         numeric_gradient_type=None):
     z = np_func(x, y)
     zs = list(z.shape)
-    with self.test_session():
+    with self.cached_session():
       inx = ops.convert_to_tensor(x)
       iny = ops.convert_to_tensor(y)
       if x.dtype in (np.float32, np.float64):
@@ -191,7 +195,7 @@ class BroadcastSimpleTest(test.TestCase):
                         numeric_gradient_type=None):
     z = np_func(x, y)
     zs = list(z.shape)
-    with self.test_session():
+    with self.cached_session():
       inx = ops.convert_to_tensor(x)
       iny = ops.convert_to_tensor(y)
       if x.dtype in (np.float32, np.float64):
@@ -234,7 +238,7 @@ class GpuMultiSessionMemoryTest(test_util.TensorFlowTestCase):
     n_iterations = 500
     with session as s:
       data = variables.Variable(1.0)
-      with ops.device('/gpu:0'):
+      with ops.device('/device:GPU:0'):
         random_seed.set_random_seed(1)
         matrix1 = variables.Variable(
             random_ops.truncated_normal([1024, 1]), name='matrix1')
@@ -256,7 +260,7 @@ class GpuMultiSessionMemoryTest(test_util.TensorFlowTestCase):
     threads = []
     results = []
     for _ in xrange(n_threads):
-      session = self.test_session(graph=ops.Graph(), use_gpu=True)
+      session = self.session(graph=ops.Graph(), use_gpu=True)
       results.append(set())
       args = (session, results[-1])
       threads.append(threading.Thread(target=self._run_session, args=args))

@@ -20,8 +20,9 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "tensorflow/compiler/xla/layout_util.h"
-#include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor_with_default.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_evaluator.h"
@@ -35,22 +36,31 @@ limitations under the License.
 namespace xla {
 
 StatusOr<bool> HloConstantFolding::Run(HloModule* module) {
-  auto evaluator = MakeUnique<HloEvaluator>();
+  // Limit the constant folding to 0 iterations to skip folding loops. This
+  // retains the behavior from before while loop support in HloEvaluator and may
+  // be revised.
+  auto evaluator = absl::make_unique<HloEvaluator>(/*max_loop_iterations=*/0);
 
   XLA_VLOG_LINES(2,
                  "HloConstantFolding::Run(), before:\n" + module->ToString());
   bool changed = false;
 
-  for (auto& computation : module->computations()) {
+  for (auto* computation : module->MakeNonfusionComputations()) {
     for (auto instruction : computation->MakeInstructionPostOrder()) {
       // Skip dead code.
       if (instruction->user_count() == 0 &&
           computation->root_instruction() != instruction) {
         continue;
       }
-      // Skip Constant and Parameter operation.
+      // Skip Constant, Parameter, and AfterAll operation.
+      // TODO(b/64407269): Enable Tuple once the timeout issue is resolved.
+      // TODO(b/110532604): Enable AfterAll once AfterAll requires at least one
+      // operand in which case constant folding will be impossible and this
+      // special case is not necessary.
       if (instruction->opcode() == HloOpcode::kParameter ||
-          instruction->opcode() == HloOpcode::kConstant) {
+          instruction->opcode() == HloOpcode::kConstant ||
+          instruction->opcode() == HloOpcode::kTuple ||
+          instruction->opcode() == HloOpcode::kAfterAll) {
         continue;
       }
       // Skip instructions with non-constant operands.
@@ -58,17 +68,18 @@ StatusOr<bool> HloConstantFolding::Run(HloModule* module) {
         continue;
       }
 
-      // Broadcasts dramatically increase the size of constants with is often
-      // detrimental to performance and memory capacity so do not fold
+      // Broadcasts dramatically increase the size of constants, which is often
+      // detrimental to performance and memory capacity, so do not fold
       // broadcasts.
-      if (instruction->opcode() == HloOpcode::kBroadcast) {
+      if (instruction->opcode() == HloOpcode::kBroadcast ||
+          instruction->opcode() == HloOpcode::kIota) {
         continue;
       }
 
-      std::unique_ptr<Literal> result = evaluator->TryEvaluate(instruction);
+      Literal result;
       // Currently we skip unimplemented operations.
       // TODO(b/35975797): Fold constant computations for more operations.
-      if (result == nullptr) {
+      if (!evaluator->TryEvaluate(instruction, &result)) {
         VLOG(2) << "Constant folding failed for instruction: "
                 << instruction->ToString();
         continue;

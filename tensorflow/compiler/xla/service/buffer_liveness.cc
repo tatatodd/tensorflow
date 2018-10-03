@@ -20,8 +20,9 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
-#include "tensorflow/compiler/xla/service/liveness_util.h"
 #include "tensorflow/compiler/xla/service/logical_buffer.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
@@ -29,40 +30,39 @@ limitations under the License.
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
 #include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/strings/str_util.h"
-#include "tensorflow/core/lib/strings/stringprintf.h"
 #include "tensorflow/core/platform/logging.h"
 
 namespace xla {
 
 /* static */
 StatusOr<std::unique_ptr<BufferLiveness>> BufferLiveness::Run(
-    const HloModule* module, std::unique_ptr<HloOrdering> hlo_ordering,
-    TuplePointsToAnalysis::Colorer colorer) {
+    const HloModule* module, std::unique_ptr<HloOrdering> hlo_ordering) {
   std::unique_ptr<BufferLiveness> liveness(
-      new BufferLiveness(module, std::move(hlo_ordering), std::move(colorer)));
+      new BufferLiveness(module, std::move(hlo_ordering)));
   TF_RETURN_IF_ERROR(liveness->Analyze());
   return std::move(liveness);
 }
 
-tensorflow::Status BufferLiveness::Analyze() {
-  TF_ASSIGN_OR_RETURN(points_to_analysis_,
-                      TuplePointsToAnalysis::Run(module_, colorer_));
-  for (auto& computation : module_->computations()) {
+Status BufferLiveness::Analyze() {
+  TF_ASSIGN_OR_RETURN(points_to_analysis_, TuplePointsToAnalysis::Run(module_));
+  for (auto* computation : module_->computations()) {
+    if (computation->IsFusionComputation()) {
+      continue;
+    }
     // Gather all instructions whose buffers might alias other instructions into
     // the set aliased_buffers_.  This includes those contained as a tuple
     // element in other instruction's output.
     for (const auto& instruction : computation->instructions()) {
       for (const LogicalBuffer* aliased_buffer :
-           points_to_analysis_->GetPointsToSet(instruction.get())
+           points_to_analysis_->GetPointsToSet(instruction)
                .CreateFlattenedSet()) {
-        if (aliased_buffer->instruction() != instruction.get()) {
+        if (aliased_buffer->instruction() != instruction) {
           aliased_buffers_.insert(aliased_buffer);
         }
       }
     }
 
-    if (computation.get() == module_->entry_computation()) {
+    if (computation == module_->entry_computation()) {
       const HloInstruction* root = computation->root_instruction();
       maybe_live_out_buffers_ =
           points_to_analysis_->GetPointsToSet(root).CreateFlattenedSet();
@@ -70,48 +70,57 @@ tensorflow::Status BufferLiveness::Analyze() {
   }
 
   XLA_VLOG_LINES(3, ToString());
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 string BufferLiveness::ToString() const {
   std::vector<string> pieces;
-  pieces.push_back(tensorflow::strings::Printf("BufferLiveness(module=%s):",
-                                               module_->name().c_str()));
+  pieces.push_back(
+      absl::StrFormat("BufferLiveness(module=%s):", module_->name()));
   pieces.push_back("HloOrdering:");
   pieces.push_back(hlo_ordering_->ToString());
-  pieces.push_back(tensorflow::strings::Printf("Aliased buffers:"));
+  pieces.push_back("Aliased buffers:");
   for (const LogicalBuffer* buffer : aliased_buffers_) {
-    pieces.push_back(
-        tensorflow::strings::Printf("  %s", buffer->ToString().c_str()));
+    pieces.push_back(absl::StrFormat("  %s", buffer->ToString()));
   }
-  pieces.push_back(tensorflow::strings::Printf("Live out buffers:"));
+  pieces.push_back("Live out buffers:");
   for (const LogicalBuffer* buffer : maybe_live_out_buffers_) {
-    pieces.push_back(
-        tensorflow::strings::Printf("  %s", buffer->ToString().c_str()));
+    pieces.push_back(absl::StrFormat("  %s", buffer->ToString()));
   }
-  return tensorflow::str_util::Join(pieces, "\n");
+  return absl::StrJoin(pieces, "\n");
 }
 
 bool BufferLiveness::live_range_strictly_before(const LogicalBuffer& a,
                                                 const LogicalBuffer& b) const {
-  TF_CHECK_OK(points_to_analysis_->VerifyBuffer(a));
-  TF_CHECK_OK(points_to_analysis_->VerifyBuffer(b));
+  TF_DCHECK_OK(points_to_analysis_->VerifyBuffer(a));
+  TF_DCHECK_OK(points_to_analysis_->VerifyBuffer(b));
 
   if (!hlo_ordering_->ExecutesBefore(a.instruction(), b.instruction())) {
     return false;
   }
 
-  // Every user of 'a' must be a predecessor of 'b' or 'b' itself.
   for (const BufferAlias& alias : points_to_analysis_->GetBufferAliases(a)) {
+    // Every user of 'a' must be a predecessor of 'b' or 'b' itself.
     for (auto user : alias.instruction()->users()) {
-      if (DoesNotUseOperandBuffer(alias.instruction(), alias.index(), user,
-                                  points_to_analysis())) {
+      if (points_to_analysis().DoesNotUseOperandBuffer(alias.instruction(),
+                                                       alias.index(), user)) {
         continue;
       }
       if (user != b.instruction() &&
           !hlo_ordering_->ExecutesBefore(user, b.instruction())) {
         return false;
       }
+    }
+
+    // If the root instruction aliases the buffer 'a', the live range of 'a' is
+    // until the end of the computation and can never be strictly before another
+    // buffer defined in the same computation. This is needed to prevent the
+    // root instruction's buffers from being reused by later instructions even
+    // when the root is not the last instruction in the schedule.
+    if (alias.instruction()->parent()->root_instruction() ==
+            alias.instruction() &&
+        alias.instruction()->parent() == b.instruction()->parent()) {
+      return false;
     }
   }
 
@@ -120,9 +129,8 @@ bool BufferLiveness::live_range_strictly_before(const LogicalBuffer& a,
   // the qualifications specified in CanShareOperandBufferWithUser.
   for (const BufferAlias& alias : points_to_analysis_->GetBufferAliases(a)) {
     if (b.instruction()->IsUserOf(alias.instruction()) &&
-        !CanShareOperandBufferWithUser(alias.instruction(), alias.index(),
-                                       b.instruction(), b.index(),
-                                       &points_to_analysis())) {
+        !points_to_analysis().CanShareOperandBufferWithUser(
+            alias.instruction(), alias.index(), b.instruction(), b.index())) {
       return false;
     }
   }
