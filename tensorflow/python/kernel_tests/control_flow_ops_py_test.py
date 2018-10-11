@@ -23,7 +23,6 @@ from __future__ import print_function
 import collections
 import math
 import time
-import unittest
 
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
@@ -334,7 +333,6 @@ class ControlFlowTest(test.TestCase):
       with self.assertRaisesOpError("has inputs from different frames"):
         res.eval(feed_dict={data: 1.0})
 
-  @test_util.disable_control_flow_v2("b/113294340")
   def testCondBool(self):
     values = constant_op.constant(10)
     fn1 = lambda: math_ops.add(values, 1)
@@ -350,6 +348,13 @@ class ControlFlowTest(test.TestCase):
     y = control_flow_ops.cond(p, fn1, fn2)
     grad = gradients_impl.gradients(y, [v])
     self.assertAllEqual([None], grad)
+
+  def testCondOutputShape(self):
+    x = constant_op.constant(1.0)
+    b = control_flow_ops.cond(
+        constant_op.constant(True), lambda: math_ops.square(x),
+        lambda: math_ops.subtract(x, 1.))
+    self.assertEqual(b.shape, tensor_shape.scalar())
 
   def testFetchable(self):
     with self.cached_session() as sess:
@@ -654,10 +659,8 @@ class ControlFlowTest(test.TestCase):
       r = control_flow_ops.cond(pred, fn1, fn2)
       sess.run(r)
 
-  @test_util.disable_control_flow_v2("b/113346829 (gpu failure)")
   def testCondGrad_1(self):
-    graph = ops.Graph()
-    with graph.as_default():
+    with self.cached_session():
       x = constant_op.constant(10.0, name="x")
       pred = math_ops.less(1, 2)
       fn1 = lambda: array_ops.identity(x)
@@ -665,8 +668,7 @@ class ControlFlowTest(test.TestCase):
       r = control_flow_ops.cond(pred, fn1, fn2)
 
       grad = gradients_impl.gradients(r, [x])[0]
-      with self.cached_session():
-        self.assertAllEqual(1.0, grad.eval())
+      self.assertAllEqual(1.0, grad.eval())
 
   def testCondGrad_2(self):
     with self.cached_session():
@@ -1113,8 +1115,8 @@ class ControlFlowTest(test.TestCase):
       self.assertAllClose(10.0, r.eval())
 
   def testWhile_Gpu_2(self):
-    self._testWhile_Gpu_1(use_gpu=False)
-    self._testWhile_Gpu_1(use_gpu=True)
+    self._testWhile_Gpu_2(use_gpu=False)
+    self._testWhile_Gpu_2(use_gpu=True)
 
   def testWhileShape(self):
     with self.cached_session():
@@ -1364,7 +1366,6 @@ class ControlFlowTest(test.TestCase):
       r = control_flow_ops.while_loop(lambda x: x < 10, body, [x0])
       self.assertEqual(10, sess.run(r, {b: True}))
 
-  @test_util.disable_control_flow_v2("b/116134862 (cond output shape)")
   def testWhileCondWithControl(self):
     # Ensure that no control edges by an outer control dependency context are
     # added to nodes inside cond/while contexts.
@@ -1476,7 +1477,6 @@ class ControlFlowTest(test.TestCase):
     self._testCondWhile_3(use_gpu=False)
     self._testCondWhile_3(use_gpu=True)
 
-  @test_util.disable_control_flow_v2("b/116134862 (cond output shape)")
   def testWhileCond_1(self):
 
     with self.cached_session():
@@ -1493,7 +1493,6 @@ class ControlFlowTest(test.TestCase):
       r = control_flow_ops.while_loop(c, b, [i])
       self.assertAllEqual(10, r.eval())
 
-  @test_util.disable_control_flow_v2("b/116134862 (cond output shape)")
   def testWhileCond_2(self):
 
     with self.cached_session():
@@ -1503,7 +1502,6 @@ class ControlFlowTest(test.TestCase):
       r = control_flow_ops.while_loop(c, b, [n])
       self.assertAllEqual(10, r.eval())
 
-  @test_util.disable_control_flow_v2("b/116134862 (cond output shape)")
   def testWhileCond_3(self):
 
     with self.cached_session():
@@ -2269,12 +2267,13 @@ class ControlFlowTest(test.TestCase):
       r = gradients_impl.gradients(r, v)[0]
       self.assertAllClose(1024.0, r.eval())
 
-  @test_util.disable_control_flow_v2("b/116272044 (cond_in_while)")
   def testWhileCondGrad_Simple(self):
     self._testWhileCondGrad_Simple(use_gpu=False)
-    self._testWhileCondGrad_Simple(use_gpu=True)
+    if not control_flow_ops.ENABLE_WHILE_V2:
+      # TODO(b/117519152): Enable.
+      self._testWhileCondGrad_Simple(use_gpu=True)
 
-  @test_util.disable_control_flow_v2("b/116272044 (cond_in_while)")
+  @test_util.disable_control_flow_v2("b/117276490")
   def testWhileCondGrad_UnknownShape(self):
     with self.cached_session() as sess:
       v = array_ops.placeholder(dtypes.float32)
@@ -3415,10 +3414,8 @@ class EagerTest(test.TestCase):
       self.assertAllEqual(r.numpy(), 10)
       self.assertFalse(isinstance(r, list))
 
-  def testCondInDefun(self):
-    if "GPU" in [d.device_type for d in device_lib.list_local_devices()]:
-      return unittest.skip("b/113346829 (gpu failure)")
-
+  # TODO(b/117279927): Re-enable once msan failure is fixed.
+  def DISABLED_testCondInDefun(self):
     with context.eager_mode():
 
       @eager_function.defun

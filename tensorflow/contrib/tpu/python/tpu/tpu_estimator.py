@@ -177,14 +177,29 @@ def _create_or_get_iterations_per_loop():
           use_resource=True)
 
 
-def _sync_variables_ops():
-  # Gets the variables back from TPU nodes. This means the variables updated
-  # by TPU will now be *synced* to host memory.
-  return [
-      array_ops.check_numerics(v.read_value(),
-                               'Gradient for %s is NaN' % v.name).op
-      for v in variables.trainable_variables()
-  ]
+def _sync_variables_ops(ctx):
+  """Create varriables synchronization ops.
+
+  Gets the variables back from TPU nodes. This means the variables updated
+  by TPU will now be *synced* to host memory.
+  In BROADCAST mode, we skip this sync since the variables are ususally too
+  big to transmit via RPC.
+
+  Args:
+    ctx: A `_InternalTPUContext` instance with mode.
+
+  Returns:
+    A list of sync ops.
+  """
+
+  if not ctx.is_input_broadcast_with_iterators():
+    return [
+        array_ops.check_numerics(v.read_value(),
+                                 'Gradient for %s is NaN' % v.name).op
+        for v in variables.trainable_variables()
+    ]
+  else:
+    return [control_flow_ops.no_op()]
 
 
 def _increase_eval_step_op(iterations_per_loop):
@@ -464,6 +479,12 @@ class TPUInfeedOutfeedSessionHook(session_run_hook.SessionRunHook):
 
     self._outfeed_controller = _OpQueueContext(
         name='OutfeedController', target=self._run_outfeed, args=(session,))
+
+    # Enable the worker watchdog to terminate workers on coordinator exit.
+    watchdog_timeout = int(os.environ.get('TF_TPU_WATCHDOG_TIMEOUT', '0'))
+    if watchdog_timeout > 0:
+      session_support.start_worker_watchdog(session,
+                                            shutdown_timeout=watchdog_timeout)
 
   def before_run(self, run_context):
     self._feed_error = None
@@ -1779,19 +1800,18 @@ class ExamplesPerSecondHook(basic_session_run_hooks.StepCounterHook):
         summary_writer=summary_writer)
 
   def _log_and_record(self, elapsed_steps, elapsed_time, global_step):
-    global_steps_per_sec = elapsed_steps / elapsed_time
-    examples_per_sec = self._batch_size * global_steps_per_sec
+    global_step_per_sec = elapsed_steps / elapsed_time
+    examples_per_sec = self._batch_size * global_step_per_sec
     if self._summary_writer is not None:
       global_step_summary = Summary(value=[
-          Summary.Value(tag='global_steps/sec',
-                        simple_value=global_steps_per_sec)
+          Summary.Value(tag='global_step/sec', simple_value=global_step_per_sec)
       ])
       example_summary = Summary(value=[
           Summary.Value(tag='examples/sec', simple_value=examples_per_sec)
       ])
       self._summary_writer.add_summary(global_step_summary, global_step)
       self._summary_writer.add_summary(example_summary, global_step)
-    logging.info('global_steps/sec: %g', global_steps_per_sec)
+    logging.info('global_step/sec: %g', global_step_per_sec)
     logging.info('examples/sec: %g', examples_per_sec)
 
 
@@ -2567,7 +2587,7 @@ class TPUEstimator(estimator_lib.Estimator):
 
           summary.scalar(model_fn_lib.LOSS_METRIC_KEY, loss)
           with ops.control_dependencies([loss]):
-            update_ops = _sync_variables_ops()
+            update_ops = _sync_variables_ops(ctx)
 
           # Validate the TPU training graph to catch basic errors
           _validate_tpu_training_graph()
@@ -2600,7 +2620,7 @@ class TPUEstimator(estimator_lib.Estimator):
             # After TPU evaluation computation is done (the mean_loss tensor),
             # reads all variables back from TPU and updates the eval step
             # counter properly
-            internal_ops_to_run = _sync_variables_ops()
+            internal_ops_to_run = _sync_variables_ops(ctx)
             internal_ops_to_run.append(
                 _increase_eval_step_op(iterations_per_loop_var))
             with ops.control_dependencies(internal_ops_to_run):
@@ -2645,7 +2665,7 @@ class TPUEstimator(estimator_lib.Estimator):
          scaffold, prediction_hooks) = _predict_on_tpu_system(
              ctx, model_fn_wrapper, dequeue_fn)
         with ops.control_dependencies([dummy_predict_op]):
-          internal_ops_to_run = _sync_variables_ops()
+          internal_ops_to_run = _sync_variables_ops(ctx)
           with ops.control_dependencies(internal_ops_to_run):
             dummy_predict_op = control_flow_ops.no_op()
 

@@ -32,13 +32,16 @@ from tensorflow.python.platform import tf_logging as logging
 _QUANTIZABLE_TYPES = {'Conv2D', 'MatMul', 'DepthwiseConv2dNative'}
 
 # Activations that are supported by the quantization rewrite.
-_ACTIVATION_TYPES = {'Relu', 'Relu6'}
+_ACTIVATION_TYPES = {'Relu', 'Relu6', 'Identity'}
+
+_RELU_TYPES = {'Relu', 'Relu6'}
 
 
 def Quantize(graph,
              is_training,
              weight_bits=8,
              activation_bits=8,
+             symmetric=False,
              ema_decay=0.999,
              quant_delay=None,
              vars_collection=ops.GraphKeys.GLOBAL_VARIABLES,
@@ -56,6 +59,8 @@ def Quantize(graph,
     is_training: Whether quantizing training graph or eval graph.
     weight_bits: Number of bits to use for quantizing weights.
     activation_bits: Number of bits to use for quantizing activations.
+    symmetric: (Optional) If true, use symmetric quantization limits instead of
+      training the minimum and maximum of each quantization range separately.
     ema_decay: (Optional) Float, EMA decay parameter.  EMA is used to update
       quantization intervals for quantizing activations (see here about EMA:
       https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average).
@@ -90,6 +95,7 @@ def Quantize(graph,
         narrow_range=True,
         vars_collection=vars_collection,
         bits=weight_bits,
+        symmetric=symmetric,
         consumer_scope=scope)
 
     # Quantize the activations.
@@ -115,6 +121,7 @@ def Quantize(graph,
         quant_delay=quant_delay,
         vars_collection=vars_collection,
         bits=activation_bits,
+        symmetric=symmetric,
         init_min=0.0,
         producer_scope=scope)
 
@@ -133,6 +140,7 @@ def Quantize(graph,
           quant_delay=quant_delay,
           vars_collection=vars_collection,
           bits=activation_bits,
+          symmetric=symmetric,
           producer_scope=scope,
           consumer_scope=scope)
       # Make sure the op following this isn't an activation. In which case, we
@@ -154,6 +162,7 @@ def Quantize(graph,
             quant_delay=quant_delay,
             vars_collection=vars_collection,
             bits=activation_bits,
+            symmetric=symmetric,
             producer_scope=scope,
             consumer_scope=scope)
 
@@ -172,7 +181,7 @@ def Quantize(graph,
       # Add at inference time.
       consumers = input_to_ops_map.ConsumerOperations(
           layer_match.post_activation_bypass_op)
-      if any([consumer.type in _ACTIVATION_TYPES for consumer in consumers]):
+      if any([consumer.type in _RELU_TYPES for consumer in consumers]):
         logging.info('Skipping %s, because its followed by an activation.',
                      layer_match.post_activation_bypass_op.name)
       else:
@@ -187,6 +196,7 @@ def Quantize(graph,
             quant_delay=quant_delay,
             vars_collection=vars_collection,
             bits=activation_bits,
+            symmetric=symmetric,
             producer_scope=scope)
 
 
@@ -384,10 +394,11 @@ def _FindLayersToQuantize(graph):
       bias_add_op = match_result.get_op(folded_bias_add_pattern)
     bypass_op = match_result.get_op(bypass_pattern)
     if layer_op not in matched_layer_set:
-      matched_layer_set.add(layer_op)
-      layer_matches.append(
-          _LayerMatch(layer_op, weight_tensor, activation_op, bypass_op, None,
-                      bias_add_op))
+      if not _IsSkipLayer(activation_op):
+        matched_layer_set.add(layer_op)
+        layer_matches.append(
+            _LayerMatch(layer_op, weight_tensor, activation_op, bypass_op, None,
+                        bias_add_op))
 
   # Match the final layer, where there may not be an activation and instead
   # the output of the final BiasAdd must be quantized. So we treat the BiasAdd
@@ -422,6 +433,32 @@ def _FindLayersToQuantize(graph):
           _LayerMatch(layer_op, weight_tensor, activation_op, None, None, None))
 
   return layer_matches
+
+
+def _IsSkipLayer(activation_op):
+  """Skip quantizing conv->identity->Batch norm layers.
+
+  Args:
+    activation_op: Activation op detected by layer matching pattern
+
+  Returns:
+    skip_layer: boolean, true when conv->identity->batch norm is detected.
+  """
+
+  # Exclude quantization of conv->identity->BN,
+  # After folding, this part corresponds to estimation of mean and variance
+  # and should not be quantized.
+  skip_layer = False
+  if activation_op.type == 'Identity' and len(activation_op.outputs) == 1:
+    if len(activation_op.outputs[0].consumers()) == 1:
+      consumer = activation_op.outputs[0].consumers()[0]
+      if consumer.type == 'FusedBatchNorm':
+        skip_layer = True
+        logging.info(
+            'Skipping quantizing %s, because it is the output of a conv/fc'
+            'followed by a identity, feeding a fused batch norm.',
+            activation_op.name)
+  return skip_layer
 
 
 class _LayerMatch(object):
@@ -488,6 +525,7 @@ def _InsertQuantOp(context,
                    init_min=-6.0,
                    init_max=6.0,
                    bits=8,
+                   symmetric=False,
                    ema_decay=0.999,
                    quant_delay=None,
                    vars_collection=ops.GraphKeys.GLOBAL_VARIABLES,
@@ -508,6 +546,8 @@ def _InsertQuantOp(context,
     init_min: Starting minimum value for the new quantization op.
     init_max: Starting maximum value for the new quantization op.
     bits: Number of bits to use for quantization, must be between 2 and 8.
+    symmetric: (Optional) If true, use symmetric quantization limits instead of
+      training the minimum and maximum of each quantization range separately.
     ema_decay: (Optional) Float, EMA decay parameter.  EMA is used to update
       quantization intervals for quantizing activations (see here about EMA:
       https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average).
@@ -574,6 +614,7 @@ def _InsertQuantOp(context,
               ema_decay=ema_decay,
               is_training=is_training,
               num_bits=bits,
+              symmetric=symmetric,
               narrow_range=narrow_range,
               vars_collection=vars_collection,
               name_prefix=name_prefix))
@@ -585,6 +626,7 @@ def _InsertQuantOp(context,
               init_max=init_max,
               is_training=is_training,
               num_bits=bits,
+              symmetric=symmetric,
               narrow_range=narrow_range,
               vars_collection=vars_collection,
               name_prefix=name_prefix))
@@ -600,6 +642,7 @@ def _InsertQuantOp(context,
           lambda: inputs,
           name=name_prefix + '/delayed_quant')
   else:
+    #  return
     # If a fake quant op is present already, make sure that
     # any downstream use of the tensor reroutes to the appropriate quantized
     # tensor. If there is no quant_delay, this is simply the output of the

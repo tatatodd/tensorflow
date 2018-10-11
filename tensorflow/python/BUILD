@@ -1154,6 +1154,7 @@ py_library(
         ":tensor_shape",
         ":util",
         ":variable_scope",
+        "//tensorflow/core:protos_all_py",
         "//tensorflow/python/eager:context",
     ],
 )
@@ -1241,7 +1242,10 @@ py_test(
     data = ["//tensorflow/python:meta_graph_testdata"],
     main = "framework/meta_graph_test.py",
     srcs_version = "PY2AND3",
-    tags = ["no_pip"],
+    tags = [
+        "no_pip",
+        "no_windows",
+    ],
     deps = [
         ":array_ops",
         ":client_testlib",
@@ -2152,6 +2156,7 @@ py_library(
         ":array_grad",
         ":array_ops",
         ":bitwise_ops",
+        ":check_ops",
         ":cond_v2_impl",
         ":control_flow_grad",
         ":control_flow_ops",
@@ -2172,9 +2177,11 @@ py_library(
         ":random_grad",
         ":resource_variable_ops",
         ":spectral_grad",
+        ":tensor_array_ops",
+        ":tensor_util",
         ":util",
         ":variable_scope",
-        "//tensorflow/python/eager:backprop",
+        "//tensorflow/core:protos_all_py",
         "//tensorflow/python/eager:context",
         "//tensorflow/python/eager:tape",
         "//third_party/py/numpy",
@@ -5190,6 +5197,19 @@ cuda_py_test(
         "//tensorflow/core:protos_all_py",
     ],
     main = "ops/concat_benchmark.py",
+)
+
+cuda_py_test(
+    name = "control_flow_ops_benchmark",
+    srcs = ["ops/control_flow_ops_benchmark.py"],
+    additional_deps = [
+        ":client_testlib",
+        ":constant_op",
+        ":control_flow_ops",
+        ":framework_ops",
+        "//tensorflow/python/eager:function",
+    ],
+    main = "ops/control_flow_ops_benchmark.py",
 )
 
 cuda_py_test(

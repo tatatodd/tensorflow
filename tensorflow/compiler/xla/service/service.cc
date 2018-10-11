@@ -207,7 +207,7 @@ Status Service::ValidateResultShape(const Shape& client_shape,
 StatusOr<std::vector<std::vector<const ShapedBuffer*>>>
 Service::ResolveAndValidateArguments(
     absl::Span<const GlobalDataHandle* const> arguments,
-    absl::Span<se::StreamExecutor* const> stream_executors) {
+    absl::Span<se::StreamExecutor* const> stream_executors) const {
   CHECK_EQ(options_.number_of_replicas(), stream_executors.size());
   std::vector<std::vector<const ShapedBuffer*>> replicated_arguments;
   replicated_arguments.resize(options_.number_of_replicas());
@@ -345,8 +345,7 @@ StatusOr<std::vector<std::unique_ptr<Executable>>> Service::BuildExecutables(
   for (int64 i = 0; i < module_protos.size(); ++i) {
     const HloModuleProto* proto = module_protos[i];
     const HloModuleConfig& config = *module_configs[i];
-    TF_ASSIGN_OR_RETURN(auto module,
-                        HloModule::CreateFromProto(*proto, config));
+    TF_ASSIGN_OR_RETURN(auto module, CreateModuleFromProto(*proto, config));
     modules.push_back(std::move(module));
   }
 
@@ -590,7 +589,7 @@ StatusOr<std::vector<se::StreamExecutor*>> Service::GetExecutors(
 
 StatusOr<std::vector<std::vector<const ShapedBuffer*>>> Service::GetArguments(
     const ExecutionOptions& execution_options,
-    absl::Span<const GlobalDataHandle* const> arguments) {
+    absl::Span<const GlobalDataHandle* const> arguments) const {
   // Resolve the allocations for the arguments of the computation, and create
   // a vector of device memory offsets for the arguments from the allocations.
   // In the case of partitioned computations, assume all arguments go on the
@@ -810,7 +809,7 @@ StatusOr<std::unique_ptr<Executable>> Service::BuildExecutable(
   }
 
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
-                      HloModule::CreateFromProto(module_proto, *module_config));
+                      CreateModuleFromProto(module_proto, *module_config));
 
   TF_RETURN_IF_ERROR(MaybeDumpUnoptimizedHloModule(*module));
 
@@ -1081,7 +1080,7 @@ Status Service::ComputeConstantGraph(const ComputeConstantGraphRequest* arg,
   HloModuleConfig config(program_shape);
 
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
-                      HloModule::CreateFromProto(arg->computation(), config));
+                      CreateModuleFromProto(arg->computation(), config));
 
   HloEvaluator evaluator;
   TF_ASSIGN_OR_RETURN(auto result_literal, evaluator.Evaluate<Literal>(
@@ -1118,7 +1117,7 @@ Status Service::GetComputationGraphStats(
   HloModuleConfig config(arg->computation().program_shape());
   config.set_debug_options(arg->debug_options());
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
-                      HloModule::CreateFromProto(arg->computation(), config));
+                      CreateModuleFromProto(arg->computation(), config));
 
   hlo_graph_dumper::MaybeDumpHloModule(*module,
                                        "computation statistics subject");
