@@ -2149,6 +2149,34 @@ ENTRY %CustomCallIncompatibleOperandConstraints (p0: f32[42,2,3], p1: f32[123,4]
                   "operand 1 is not compatible with operand shape");
 }
 
+TEST_F(HloParserTest, AllowShapeWhitespace) {
+  const string text = R"(
+HloModule module
+
+ENTRY entry {
+  ROOT root = f32[ 1, 2,3, 4, 5]{0, 1, 2,3, 4 } parameter(0)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseHloString(text));
+}
+
+TEST_F(HloParserTest, ShapeMismatchInOperand) {
+  const string text = R"(
+HloModule foobar
+
+ENTRY %entrycomp (p: f32[2,2]) -> f32[2,2] {
+  %p = f32[2,2] parameter(0)
+  %constant.1 = f32[2,2] constant(f32[2,2] {{1, 2}, {3, 4}})
+  ROOT %add.1 = f32[2,2] add(f32[2,2] %p, f32[2,5] %constant.1)
+}
+)";
+
+  ExpectHasSubstr(ParseHloString(text).status().error_message(),
+                  "The declared operand shape f32[2,5]{1,0} is not compatible"
+                  " with the shape of the operand instruction f32[2,2]{1,0}.");
+}
+
 // custom call incompatible shape.
 
 }  // namespace

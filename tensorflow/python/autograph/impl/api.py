@@ -19,7 +19,14 @@ from __future__ import division
 from __future__ import print_function
 
 import functools
+import sys
+
 from enum import Enum
+
+# pylint:disable=g-bad-import-order
+import numpy as np
+# pylint:enable=g-bad-import-order
+
 
 from tensorflow.python.autograph.core import config
 from tensorflow.python.autograph.core import converter
@@ -28,6 +35,9 @@ from tensorflow.python.autograph.operators import py_builtins
 from tensorflow.python.autograph.pyct import compiler
 from tensorflow.python.autograph.pyct import inspect_utils
 from tensorflow.python.autograph.utils import py_func
+from tensorflow.python.data.util import nest
+from tensorflow.python.framework import tensor_util
+from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import tf_decorator
 from tensorflow.python.util import tf_inspect
 
@@ -66,13 +76,14 @@ def convert(recursive=False, verbose=False):
               recursive=recursive,
               verbose=verbose,
               force_conversion=True,
+              optional_features=converter.Feature.ALL,
           ), *args, **kwargs)
 
     wrapper = tf_decorator.make_decorator(f, wrapper)
 
     # Sometimes the decorator is just desugared, making it impossible to detect.
     # This attribute makes detection easier.
-    setattr(wrapper, '__pyct_is_compile_decorator', True)
+    setattr(wrapper, '__ag_compiled', True)
     return wrapper
 
   return decorator
@@ -133,7 +144,7 @@ def do_not_convert(run_as=RunMode.GRAPH, return_dtypes=None):
 
     # Sometimes the decorator is just desugared, making it impossible to detect.
     # This attribute makes detection easier.
-    setattr(wrapper, '__pyct_is_compile_decorator', True)
+    setattr(wrapper, '__ag_compiled', True)
     return wrapper
 
   return decorator
@@ -142,6 +153,9 @@ def do_not_convert(run_as=RunMode.GRAPH, return_dtypes=None):
 # TODO(mdan): Move to a private, undocumented module.
 def converted_call(f, owner, options, *args, **kwargs):
   """Compiles a function call inline. For internal use only."""
+  if options.verbose:
+    logging.info('Converted call: {}; owner: {}'.format(f, owner))
+
   if owner is not None:
     if not isinstance(f, str):
       raise ValueError(
@@ -161,10 +175,15 @@ def converted_call(f, owner, options, *args, **kwargs):
   if not options.force_conversion and conversion.is_whitelisted_for_graph(f):
     return f(*args, **kwargs)
 
-  unknown_arg_value = object()  # Sentinel for arguments of unknown value
-
   if inspect_utils.isbuiltin(f):
     return py_builtins.overload_of(f)(*args, **kwargs)
+
+  # internal_convert_user_code is for example turned off when issuing a dynamic
+  # call conversion from generated code while in nonrecursive mode. In that
+  # case we evidently don't want to recurse, but we still have to convert
+  # things like builtins.
+  if not options.internal_convert_user_code:
+    return f(*args, **kwargs)
 
   if tf_inspect.isfunction(f) or tf_inspect.ismethod(f):
     # Regular functions
@@ -210,8 +229,6 @@ def converted_call(f, owner, options, *args, **kwargs):
   arg_values = tf_inspect.getcallargs(arg_map_target, *args, **kwargs)
   arg_types = {}
   for name, arg in arg_values.items():
-    if arg is unknown_arg_value:
-      continue
     arg_class = arg.__class__
     arg_types[name] = (arg_class.__name__, arg_class)
 
@@ -233,8 +250,32 @@ def converted_call(f, owner, options, *args, **kwargs):
       arg_values=arg_values,
       arg_types=arg_types,
       partial_types=partial_types,
-      strip_decorators=options.strip_decorators)
-  return converted_f(*effective_args, **kwargs)
+      strip_decorators=options.strip_decorators,
+      optional_features=options.optional_features)
+
+  result = converted_f(*effective_args, **kwargs)
+  # When converting a function, we write a tmp file and import it as a module.
+  # This leaks the module's closure. Once we've executed the converted_f module
+  # and there is no more code left to be executed, we can clean up the module.
+
+  # TODO(mdan): Look into workarounds that don't suffer from refcount leaks.
+  # Possibly attach the closure as a regular closure cell, instead of relying on
+  # module globals.
+
+  # If there are callables in the result, they will fail to find their closure
+  # when called, so only delete module if all returned types are not callable.
+  flat_results = nest.flatten(result)
+  if all(map(_is_not_callable, flat_results)):
+    del sys.modules[converted_f.__module__]
+
+  return result
+
+
+def _is_not_callable(obj):
+  # TODO(brianklee): What happens if obj is a tensor wrapping a py_func?
+  return (isinstance(obj,
+                     (int, float, complex, str, bool, np.ndarray, np.generic))
+          or tensor_util.is_tensor(obj))
 
 
 # TODO(mdan): Rename: to_ops?
@@ -246,7 +287,8 @@ def to_graph(e,
              arg_values=None,
              arg_types=None,
              partial_types=None,
-             strip_decorators=None):
+             strip_decorators=None,
+             optional_features=converter.Feature.ALL):
   """Converts a Python entity into equivalent code that uses TensorFlow ops.
 
   Supported Python entities include:
@@ -267,6 +309,8 @@ def to_graph(e,
     partial_types: Set[Type], reserved for internal use.
     strip_decorators: Tuple[Callable], same as
       ConversionOptions.strip_decorators.
+    optional_features: Union[Feature, Set[Feature]], same as
+      ConversionOptions.optional_features.
 
   Returns:
     Union[Callable, Type], the converted entity, which is the same kind as e
@@ -284,7 +328,8 @@ def to_graph(e,
       options=converter.ConversionOptions(
           recursive=recursive,
           verbose=verbose,
-          strip_decorators=strip_decorators),
+          strip_decorators=strip_decorators,
+          optional_features=optional_features),
       partial_types=partial_types,
       autograph_module=tf_inspect.getmodule(to_graph),
       uncompiled_modules=config.DEFAULT_UNCOMPILED_MODULES)
@@ -295,7 +340,7 @@ def to_graph(e,
   for dep in reversed(program_ctx.conversion_order):
     nodes.extend(program_ctx.dependency_cache[dep])
 
-  compiled_module, compiled_src = compiler.ast_to_object(
+  compiled_module, _ = compiler.ast_to_object(
       nodes,
       source_prefix=program_ctx.required_imports,
       include_source_map=True)
@@ -307,6 +352,9 @@ def to_graph(e,
     if key not in compiled_module.__dict__:
       compiled_module.__dict__[key] = val
   compiled = getattr(compiled_module, name)
+
+  if tf_inspect.isfunction(e):
+    compiled.__defaults__ = e.__defaults__
 
   # Need this so the source_mapping attribute is available for the context
   # manager to access for runtime errors.

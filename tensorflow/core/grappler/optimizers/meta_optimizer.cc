@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/grappler/optimizers/meta_optimizer.h"
+#include "absl/strings/substitute.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/function.pb.h"
 #include "tensorflow/core/framework/versions.pb.h"
@@ -85,6 +86,18 @@ bool IsTPUGraphDef(const GraphDef& def) {
   return false;
 }
 
+uint64 DeadlineMicroSeconds(const RewriterConfig& cfg) {
+  const uint64 kFiveMinutesInUsec = 5 * 60 * 1000 * 1000;
+  if (cfg.meta_optimizer_timeout_ms() < 0) {
+    return 0;
+  } else {
+    return cfg.meta_optimizer_timeout_ms() == 0
+               ? Env::Default()->NowMicros() + kFiveMinutesInUsec
+               : Env::Default()->NowMicros() +
+                     cfg.meta_optimizer_timeout_ms() * 1000;
+  }
+}
+
 }  // namespace
 
 #define MK_OPT(NAME, VALUE) \
@@ -113,6 +126,12 @@ std::unique_ptr<GraphOptimizer> MetaOptimizer::MakeNewOptimizer(
 }
 
 #undef MK_OPT
+
+MetaOptimizer::MetaOptimizer(DeviceBase* cpu_device, const RewriterConfig& cfg)
+    : cpu_device_(cpu_device), cfg_(cfg) {
+  DCHECK(cpu_device_ == nullptr ||
+         cpu_device_->attributes().device_type() == "CPU");
+}
 
 Status MetaOptimizer::InitializeOptimizers(
     std::vector<std::unique_ptr<GraphOptimizer>>* optimizers) const {
@@ -309,6 +328,7 @@ Status MetaOptimizer::OptimizeGraph(Cluster* cluster, const GrapplerItem& item,
 
     VLOG(4) << "Starting optimization iteration " << iteration;
     for (const auto& optimizer : optimizers) {
+      GRAPPLER_RETURN_IF_DEADLINE_EXCEEDED();
       // Some optimizers can run only once.
       if (iteration > 0 && IsRunOnceOptimizer(optimizer->name())) continue;
       // Some must run only on the last iteration.
@@ -367,6 +387,7 @@ Status MetaOptimizer::RunOptimizer(
   // resets optimized_graph to an empty graph.
   optimized_graph->Swap(&optimized_item->graph);
   *optimized_graph = GraphDef();
+  optimizer->set_deadline_usec(this->deadline_usec());
   Status status =
       optimizer->Optimize(cluster, *optimized_item, optimized_graph);
   uint64 end_us = Env::Default()->NowMicros();
@@ -393,9 +414,33 @@ Status MetaOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
   VLOG(1) << "Starting optimization for grappler item: " << item.id;
   optimization_results_.clear();
 
+  // 0. Original graph might contain a huge function library, that is mostly
+  // unused. This library copied over by each individual Grappler optimizer,
+  // which adds a huge overhead. Before starting optimization passes we just
+  // remove all the unreachable functions.
+  // TODO(ezhulenev): Construct reachable function library definition directly
+  // from the proto without constructing temporary FunctionLibraryDefinition.
+  GraphDef trimmed_graph;  // do not copy graph with a potentially huge library
+  *trimmed_graph.mutable_node() = item.graph.node();
+  *trimmed_graph.mutable_versions() = item.graph.versions();
+  *trimmed_graph.mutable_library() =
+      grappler::ReachableFunctionLibraryDefinition(
+          FunctionLibraryDefinition(OpRegistry::Global(), item.graph.library()),
+          item.graph)
+          .ToProto();
+
+  GrapplerItem trimmed_item(item, std::move(trimmed_graph));
+
+  VLOG(1) << absl::Substitute(
+      "Deleted $0 unreachable functions from the graph (library size = $1)",
+      item.graph.library().function_size() -
+          trimmed_item.graph.library().function_size(),
+      trimmed_item.graph.library().function_size());
+
   // 1. Optimize main graph
-  TF_RETURN_IF_ERROR(OptimizeGraph(cluster, item, optimized_graph));
+  TF_RETURN_IF_ERROR(OptimizeGraph(cluster, trimmed_item, optimized_graph));
   VLOG(1) << "Optimized main graph.";
+  GRAPPLER_RETURN_IF_DEADLINE_EXCEEDED();
 
   // Skip optimizing functions if this is a TPU graph. Currently, Grappler
   // passes do not handle TPU functions correctly in a variety of ways (Note
@@ -410,12 +455,14 @@ Status MetaOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
     return Status::OK();
   }
 
-  // 2. Optimize function library
-  FunctionLibraryDefinition flib(OpRegistry::Global(),
-                                 optimized_graph->library());
+  // 2. Optimize functions reachable from the optimized graph.
+  FunctionLibraryDefinition flib = ReachableFunctionLibraryDefinition(
+      FunctionLibraryDefinition(OpRegistry::Global(),
+                                optimized_graph->library()),
+      *optimized_graph);
 
   // Find functions for which we might need to compute a gradient at runtime.
-  gtl::FlatSet<string> differentiable_functions;
+  absl::flat_hash_set<string> differentiable_functions;
   for (const NodeDef& node : optimized_graph->node()) {
     if (IsSymbolicGradient(node)) {
       const auto* f_attr = gtl::FindOrNull(node.attr(), "f");
@@ -424,14 +471,19 @@ Status MetaOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
   }
 
   // Optimize each function only once.
-  std::unordered_set<string> optimized_funcs;
+  absl::flat_hash_set<string> optimized_funcs;
   bool optimize_function_library = true;
 
   while (optimize_function_library) {
     optimize_function_library = false;
 
     for (const FunctionDef& func : optimized_graph->library().function()) {
+      GRAPPLER_RETURN_IF_DEADLINE_EXCEEDED();
+
       const string& func_name = func.signature().name();
+
+      // Skip functions that are not reachable from the optimized graph.
+      if (!flib.Contains(func_name)) continue;
 
       // Skip already optimized functions.
       if (optimized_funcs.find(func_name) != optimized_funcs.end()) continue;
@@ -452,7 +504,7 @@ Status MetaOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
       // Make a GrapplerItem from a FunctionDef.
       GrapplerFunctionItem func_item;
       TF_RETURN_IF_ERROR(MakeGrapplerFunctionItem(
-          func, flib, item.graph.versions().producer(), &func_item));
+          func, flib, trimmed_item.graph.versions().producer(), &func_item));
 
       // If we need to compute the gradient of optimized function at runtime, we
       // can't perform non-differentiable rewrites.
@@ -535,7 +587,12 @@ Status RunMetaOptimizer(const GrapplerItem& item, const RewriterConfig& cfg,
                         DeviceBase* cpu_device, Cluster* cluster,
                         GraphDef* optimized_graph) {
   MetaOptimizer optimizer(cpu_device, cfg);
-  return optimizer.Optimize(cluster, item, optimized_graph);
+  optimizer.set_deadline_usec(DeadlineMicroSeconds(cfg));
+  Status status = optimizer.Optimize(cluster, item, optimized_graph);
+  if (!status.ok()) {
+    *optimized_graph = item.graph;
+  }
+  return status;
 }
 
 }  // namespace grappler

@@ -22,14 +22,17 @@ limitations under the License.
 
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_def.pb.h"
+#include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/scanner.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/notification.h"
+#include "tensorflow/core/util/device_name_utils.h"
 
 namespace tensorflow {
 namespace grappler {
@@ -546,6 +549,30 @@ Status SetTensorValue(DataType dtype, int value, Tensor* tensor) {
 }
 
 #undef HANDLE_CASE
+
+Status CheckAttrExists(const NodeDef& node, const string& key) {
+  if (!HasNodeAttr(node, key)) {
+    return errors::InvalidArgument("Node '", node.name(), "' lacks '", key,
+                                   "' attr: ", node.ShortDebugString());
+  }
+  return Status::OK();
+}
+
+Status CheckAttrsExist(const NodeDef& node, absl::Span<const string> keys) {
+  for (const string& key : keys) {
+    TF_RETURN_IF_ERROR(CheckAttrExists(node, key));
+  }
+  return Status::OK();
+}
+
+Status IsKernelRegisteredForNode(const NodeDef& node) {
+  DeviceNameUtils::ParsedName parsed_name;
+  if (!DeviceNameUtils::ParseFullName(node.device(), &parsed_name)) {
+    return errors::InvalidArgument("Could not parse device name: ",
+                                   node.device());
+  }
+  return FindKernelDef(DeviceType(parsed_name.type), node, nullptr, nullptr);
+}
 
 }  // end namespace grappler
 }  // end namespace tensorflow

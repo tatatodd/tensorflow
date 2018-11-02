@@ -97,6 +97,73 @@ TEST_F(AlgebraicSimplifierTest, MulZero) {
   EXPECT_EQ(computation->root_instruction(), zero);
 }
 
+// Test that select(true, a, b) is simplified to a
+TEST_F(AlgebraicSimplifierTest, SelectTrue) {
+  Shape r0s32 = ShapeUtil::MakeShape(S32, {});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r0s32, "param0"));
+  HloInstruction* param1 = builder.AddInstruction(
+      HloInstruction::CreateParameter(1, r0s32, "param1"));
+  HloInstruction* one = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(true)));
+  builder.AddInstruction(HloInstruction::CreateTernary(
+      r0s32, HloOpcode::kSelect, one, param0, param1));
+
+  auto module = CreateNewVerifiedModule();
+  auto computation = module->AddEntryComputation(builder.Build());
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kSelect);
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 non_bitcasting_callback());
+  ASSERT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  EXPECT_EQ(computation->root_instruction(), param0);
+}
+
+// Test that select(false, a, b) is simplified to b
+TEST_F(AlgebraicSimplifierTest, SelectFalse) {
+  Shape r0s32 = ShapeUtil::MakeShape(S32, {});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r0s32, "param0"));
+  HloInstruction* param1 = builder.AddInstruction(
+      HloInstruction::CreateParameter(1, r0s32, "param1"));
+  HloInstruction* zero = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
+  builder.AddInstruction(HloInstruction::CreateTernary(
+      r0s32, HloOpcode::kSelect, zero, param0, param1));
+
+  auto module = CreateNewVerifiedModule();
+  auto computation = module->AddEntryComputation(builder.Build());
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kSelect);
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 non_bitcasting_callback());
+  ASSERT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  EXPECT_EQ(computation->root_instruction(), param1);
+}
+
+// Test that select(a, b, b) is simplified to b
+TEST_F(AlgebraicSimplifierTest, SelectIdentical) {
+  Shape r0s32 = ShapeUtil::MakeShape(S32, {});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r0s32, "param0"));
+  HloInstruction* param1 = builder.AddInstruction(
+      HloInstruction::CreateParameter(1, r0s32, "param1"));
+  builder.AddInstruction(HloInstruction::CreateTernary(
+      r0s32, HloOpcode::kSelect, param0, param1, param1));
+
+  auto module = CreateNewVerifiedModule();
+  auto computation = module->AddEntryComputation(builder.Build());
+  HloInstruction* root = computation->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kSelect);
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 non_bitcasting_callback());
+  ASSERT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  EXPECT_EQ(computation->root_instruction(), param1);
+}
+
 // Test that Reduce(Reduce(A)) -> Reduce(A)
 TEST_F(AlgebraicSimplifierTest, TwoReducesToOne) {
   HloComputation::Builder builder(TestName());
@@ -3094,6 +3161,92 @@ TEST_F(AlgebraicSimplifierTest, MergeBroadcastAndIota2) {
   root = computation->root_instruction();
   EXPECT_THAT(root, op::Iota());
   EXPECT_EQ(Cast<HloIotaInstruction>(root)->iota_dimension(), 2);
+}
+
+TEST_F(AlgebraicSimplifierTest, SliceOfPadLow) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      param = f32[3,4] parameter(0)
+      constant = f32[] constant(0.0)
+      pad = f32[8,10] pad(f32[3,4] param, f32[] constant), padding=3_2x1_5
+      ROOT slice = f32[1,1] slice(f32[8,10] pad), slice={[2:3],[0:1]}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      HloRunner::CreateModuleFromString(hlo_string, GetDebugOptionsForTest()));
+
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 bitcasting_callback());
+  EXPECT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  auto root = module->entry_computation()->root_instruction();
+  EXPECT_THAT(root, op::Reshape(op::Constant()));
+}
+
+TEST_F(AlgebraicSimplifierTest, SliceOfPadHigh) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      param = f32[3,4] parameter(0)
+      constant = f32[] constant(0.0)
+      pad = f32[8,10] pad(f32[3,4] param, f32[] constant), padding=3_2x1_5
+      ROOT slice = f32[1,1] slice(f32[8,10] pad), slice={[6:7],[9:10]}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      HloRunner::CreateModuleFromString(hlo_string, GetDebugOptionsForTest()));
+
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 bitcasting_callback());
+  EXPECT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  auto root = module->entry_computation()->root_instruction();
+  EXPECT_THAT(root, op::Reshape(op::Constant()));
+}
+
+TEST_F(AlgebraicSimplifierTest, SliceOfPadMidNonScalar) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      param = f32[3,4] parameter(0)
+      constant = f32[] constant(0.0)
+      pad = f32[8,10] pad(f32[3,4] param, f32[] constant), padding=3_2x1_5
+      ROOT slice = f32[1,1] slice(f32[8,10] pad), slice={[5:6],[9:10]}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      HloRunner::CreateModuleFromString(hlo_string, GetDebugOptionsForTest()));
+
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 bitcasting_callback());
+  EXPECT_FALSE(simplifier.Run(module.get()).ValueOrDie());
+}
+
+TEST_F(AlgebraicSimplifierTest, SliceOfPadMidScalar) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      param = f32[1,1] parameter(0)
+      constant = f32[] constant(0.0)
+      pad = f32[8,10] pad(f32[1,1] param, f32[] constant), padding=3_4x4_5
+      ROOT slice = f32[1,1] slice(f32[8,10] pad), slice={[3:4],[4:5]}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      HloRunner::CreateModuleFromString(hlo_string, GetDebugOptionsForTest()));
+
+  AlgebraicSimplifier simplifier(/*is_layout_sensitive=*/false,
+                                 bitcasting_callback());
+  EXPECT_TRUE(simplifier.Run(module.get()).ValueOrDie());
+  auto root = module->entry_computation()->root_instruction();
+  EXPECT_THAT(root, op::Parameter());
 }
 
 struct PadReduceWindowEffectiveBroadcastCase {

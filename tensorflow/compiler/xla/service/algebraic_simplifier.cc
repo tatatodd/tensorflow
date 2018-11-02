@@ -157,6 +157,8 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
   Status HandleDynamicUpdateSlice(
       HloInstruction* dynamic_update_slice) override;
 
+  Status HandleSelect(HloInstruction* select) override;
+
   Status HandleSort(HloInstruction* sort) override;
 
   Status HandleTranspose(HloInstruction* transpose) override;
@@ -303,6 +305,10 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
 
   // Tries to use a kDot in place of the given convolution.
   StatusOr<bool> SimplifyConvToDot(HloInstruction* convolution);
+
+  // Tries to simplify a slice(pad(...)) where the result of the slice is a
+  // scalar.
+  StatusOr<bool> TrySimplifySliceOfPad(HloInstruction* slice);
 
   // Current HloComputation instance the AlgebraicSimplifierVisitor is
   // traversing.
@@ -1820,6 +1826,62 @@ Status AlgebraicSimplifierVisitor::HandleReverse(HloInstruction* reverse) {
   return Status::OK();
 }
 
+StatusOr<bool> AlgebraicSimplifierVisitor::TrySimplifySliceOfPad(
+    HloInstruction* slice) {
+  // Only try to do this for effective scalars. We could do the same for slicing
+  // out larger pieces of padding (replacing with a broadcast of the padding
+  // value), but this is probably not worth it.
+  if (!ShapeUtil::IsEffectiveScalar(slice->shape()) ||
+      slice->operand(0)->opcode() != HloOpcode::kPad) {
+    return false;
+  }
+
+  VLOG(10) << "Trying to simplify scalar slice of pad";
+  // Check there's no internal padding. Again, we could handle that too, since
+  // everything is statically known, but it's not worth it.
+  auto pad = Cast<HloPadInstruction>(slice->mutable_operand(0));
+  auto padding_config = pad->padding_config();
+  int64 rank = padding_config.dimensions_size();
+  if (HasInteriorPadding(padding_config)) {
+    VLOG(10) << "Not folding scalar slice of pad, pad has interior padding";
+    return false;
+  }
+
+  // Check whether the scalar we're slicing out falls into the padding.
+  bool in_padding = [&]() {
+    for (int64 i = 0; i < rank; ++i) {
+      int64 start = slice->slice_starts(i);
+      int64 low = padding_config.dimensions(i).edge_padding_low();
+      int64 data = pad->operand(0)->shape().dimensions(i);
+      if (start >= low && start < low + data) {
+        return false;
+      }
+    }
+    return true;
+  }();
+
+  if (in_padding) {
+    VLOG(10) << "Folding scalar slice of pad into padding value";
+    TF_RETURN_IF_ERROR(ReplaceWithNewInstruction(
+        slice, HloInstruction::CreateReshape(slice->shape(),
+                                             pad->mutable_padding_value())));
+    return true;
+  } else {
+    // We already know the output of the slice is scalar. If the padded
+    // value is scalar, and it's not in the padding, then it's exactly the
+    // output value.
+    bool replaced =
+        ReplaceInstructionIfSameShape(slice, pad->mutable_operand(0));
+    if (replaced) {
+      VLOG(10) << "Folding scalar slice of pad into padded value";
+    } else {
+      VLOG(10) << "Not folding scalar slice of pad into padded value as they "
+                  "have different shapes.";
+    }
+    return replaced;
+  }
+}
+
 Status AlgebraicSimplifierVisitor::HandleSlice(HloInstruction* slice) {
   // Delete no-op slices, i.e. where shape = operand shape.
   if (ReplaceInstructionIfSameShape(slice, slice->mutable_operand(0))) {
@@ -1844,6 +1906,12 @@ Status AlgebraicSimplifierVisitor::HandleSlice(HloInstruction* slice) {
                    slice->shape(), operand_slice->mutable_operand(0),
                    new_slice_starts, new_slice_limits, slice->slice_strides()));
   }
+
+  TF_ASSIGN_OR_RETURN(bool replaced, TrySimplifySliceOfPad(slice));
+  if (replaced) {
+    return Status::OK();
+  }
+
   return Status::OK();
 }
 
@@ -2197,6 +2265,22 @@ Status AlgebraicSimplifierVisitor::HandleReduceWindow(
                          /*init_value=*/reduce_window->mutable_operand(1),
                          /*window=*/new_window,
                          /*reduce_computation=*/function));
+}
+
+Status AlgebraicSimplifierVisitor::HandleSelect(HloInstruction* select) {
+  // select(x, y, y) -> y.
+  if (select->operand(1) == select->operand(2)) {
+    return ReplaceInstruction(select, select->mutable_operand(1));
+  }
+  // select(true, x, y) -> x.
+  if (IsAll(select->operand(0), true)) {
+    return ReplaceInstruction(select, select->mutable_operand(1));
+  }
+  // select(false, x, y) -> y.
+  if (IsAll(select->operand(0), false)) {
+    return ReplaceInstruction(select, select->mutable_operand(2));
+  }
+  return Status::OK();
 }
 
 Status AlgebraicSimplifierVisitor::HandleSort(HloInstruction* sort) {

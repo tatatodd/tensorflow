@@ -418,6 +418,18 @@ std::pair<HloInstruction*, HloParser::LocTy>* HloParser::FindInstruction(
     }
     return create_missing_instruction_(name, *shape);
   }
+
+  if (instr != nullptr && shape.has_value() &&
+      !ShapeUtil::Compatible(instr->first->shape(), shape.value())) {
+    Error(
+        lexer_.GetLoc(),
+        StrCat("The declared operand shape ",
+               ShapeUtil::HumanStringWithLayout(shape.value()),
+               " is not compatible with the shape of the operand instruction ",
+               ShapeUtil::HumanStringWithLayout(instr->first->shape()), "."));
+    return nullptr;
+  }
+
   return instr;
 }
 
@@ -1089,8 +1101,8 @@ bool HloParser::ParseInstruciontRhs(HloComputation::Builder* builder,
           absl::Span<HloInstruction* const>(operands).subspan(
               0, operands.size() / 2),
           /*init_values=*/
-          absl::Span<HloInstruction* const>(operands).subspan(
-              operands.size() / 2, operands.size()),
+          absl::Span<HloInstruction* const>(operands).subspan(operands.size() /
+                                                              2),
           *dimensions_to_reduce, *reduce_computation));
       break;
     }
@@ -2982,7 +2994,8 @@ bool HloParser::ParseShape(Shape* result) {
   }
 
   if (lexer_.GetKind() != TokKind::kShape) {
-    return TokenError("expects shape");
+    return TokenError(absl::StrCat("expected shape, saw ",
+                                   TokKindToString(lexer_.GetKind())));
   }
   *result = lexer_.GetShapeVal();
   lexer_.Lex();

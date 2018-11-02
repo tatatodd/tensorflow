@@ -113,7 +113,6 @@ tf_kernel_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core/kernels:inplace_ops",
         "//tensorflow/core/kernels/data:captured_function",
-        "//tensorflow/core/kernels/data:dataset",
         "@com_google_absl//absl/memory",
     ],
 )
@@ -140,6 +139,15 @@ tf_kernel_library(
 )
 
 tf_kernel_library(
+    name = "sleep_dataset_op",
+    srcs = ["sleep_dataset_op.cc"],
+    deps = [
+        "//tensorflow/core:experimental_dataset_ops_op_lib",
+        "//tensorflow/core:framework",
+    ],
+)
+
+tf_kernel_library(
     name = "dataset_kernels",
     deps = [
         ":assert_next_dataset_op",
@@ -150,6 +158,7 @@ tf_kernel_library(
         ":lmdb_dataset_op",
         ":numa_map_and_batch_dataset_op",
         ":prefetching_kernels",
+        ":sleep_dataset_op",
         ":threadpool_dataset_op",
         ":unique_dataset_op",
     ],
